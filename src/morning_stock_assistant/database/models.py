@@ -24,6 +24,24 @@ class Company(Base):
 
     market = Column(String(20))
 
+    current_price = Column(Float)
+
+    market_cap = Column(Float)
+
+    per = Column(Float)
+
+    eps = Column(Float)
+
+    book_value = Column(Float)
+
+    currency = Column(String(10))
+
+    sector = Column(String(100))
+
+    industry = Column(String(100))
+
+    last_collected_at = Column(DateTime)
+
     target_price = Column(Float)
 
     fair_price = Column(Float)

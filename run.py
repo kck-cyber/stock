@@ -15,9 +15,9 @@ def main():
 
     app = QApplication(sys.argv)
 
-    msa = MorningStockAssistant(PROJECT_ROOT)
+    assistant = MorningStockAssistant(PROJECT_ROOT)
 
-    msa.start()
+    assistant.start()
 
     sys.exit(app.exec())
 

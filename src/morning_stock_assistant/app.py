@@ -29,6 +29,6 @@ class MorningStockAssistant:
 
     def start(self):
 
-        self.main_window = MainWindow()
+        self.main_window = MainWindow(self.project_root)
 
         self.main_window.show()

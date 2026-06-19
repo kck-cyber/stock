@@ -1,34 +1,89 @@
 from PySide6.QtWidgets import (
-    QMainWindow,
-    QLabel,
     QWidget,
+    QLabel,
+    QLineEdit,
+    QPushButton,
     QVBoxLayout,
+    QHBoxLayout,
 )
 
+from morning_stock_assistant.services.stock_service import StockService
 
-class MainWindow(QMainWindow):
 
-    def __init__(self):
+class MainWindow(QWidget):
+
+    def __init__(self, project_root):
+
         super().__init__()
 
-        self.setWindowTitle("Morning Stock Assistant Pro v0.2")
+        self.project_root = project_root
 
-        self.resize(1200, 800)
+        self.service = StockService(project_root)
 
-        self.init_ui()
+        self.setWindowTitle("Morning Stock Assistant Pro")
 
-    def init_ui(self):
+        self.resize(700, 500)
 
-        central = QWidget()
+        self.build_ui()
+
+    def build_ui(self):
 
         layout = QVBoxLayout()
 
-        label = QLabel("Morning Stock Assistant Pro가 정상적으로 시작되었습니다.")
+        top = QHBoxLayout()
 
-        layout.addWidget(label)
+        self.keyword = QLineEdit()
 
-        central.setLayout(layout)
+        self.keyword.setPlaceholderText("종목명 또는 종목코드")
 
-        self.setCentralWidget(central)
+        self.search_button = QPushButton("검색")
 
-        self.statusBar().showMessage("Ready")
+        self.search_button.clicked.connect(self.search)
+
+        top.addWidget(self.keyword)
+
+        top.addWidget(self.search_button)
+
+        layout.addLayout(top)
+
+        self.result = QLabel()
+
+        self.result.setText("검색 결과가 여기에 표시됩니다.")
+
+        layout.addWidget(self.result)
+
+        self.setLayout(layout)
+
+    def search(self):
+
+        keyword = self.keyword.text().strip()
+
+        if not keyword:
+
+            return
+
+        data = self.service.search(keyword)
+
+        if data is None:
+
+            self.result.setText("종목을 찾을 수 없습니다.")
+
+            return
+
+        text = f"""
+회사명 : {data.get("company_name")}
+
+현재가 : {data.get("current_price")}
+
+PER : {data.get("per")}
+
+EPS : {data.get("eps")}
+
+시가총액 : {data.get("market_cap")}
+
+섹터 : {data.get("sector")}
+
+업종 : {data.get("industry")}
+"""
+
+        self.result.setText(text)
