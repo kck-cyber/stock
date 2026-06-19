@@ -6,6 +6,7 @@ Application Controller
 
 from pathlib import Path
 
+from morning_stock_assistant.database.database import DatabaseManager
 from morning_stock_assistant.gui.main_window import MainWindow
 
 
@@ -18,12 +19,15 @@ class MorningStockAssistant:
 
         self.project_root = project_root
 
+        # Database Manager
+        self.database = DatabaseManager(project_root)
+
+        # SQLite 테이블 자동 생성
+        self.database.create_tables()
+
         self.main_window = None
 
     def start(self):
-        """
-        프로그램 시작
-        """
 
         self.main_window = MainWindow()
 
