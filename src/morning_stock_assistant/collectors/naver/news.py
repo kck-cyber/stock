@@ -1,14 +1,38 @@
 """
 Naver News Collector
 
-(현재 Sprint에서는 기본 구조만 생성)
+Morning Stock Assistant Pro
 """
 
-from ..base import BaseCollector
+from urllib.parse import quote
+import feedparser
 
 
-class NaverNewsCollector(BaseCollector):
+class NaverNewsCollector:
 
-    def collect(self, keyword: str):
+    def collect(self, keyword: str, limit: int = 5):
 
-        return []
+        url = (
+            "https://news.google.com/rss/search?"
+            f"q={quote(keyword)}&hl=ko&gl=KR&ceid=KR:ko"
+        )
+
+        feed = feedparser.parse(url)
+
+        news = []
+
+        for item in feed.entries[:limit]:
+
+            news.append({
+
+                "title": item.title,
+
+                "url": item.link,
+
+                "press": "",
+
+                "date": item.published,
+
+            })
+
+        return news

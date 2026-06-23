@@ -9,6 +9,10 @@ from pathlib import Path
 from morning_stock_assistant.database.database import DatabaseManager
 from morning_stock_assistant.gui.main_window import MainWindow
 
+from morning_stock_assistant.services.stock_service import StockService
+from morning_stock_assistant.ai.analyzer import StockAnalyzer
+from morning_stock_assistant.config import CACHE_DIR, DART_API_KEY
+
 
 class MorningStockAssistant:
     """
@@ -29,6 +33,16 @@ class MorningStockAssistant:
 
     def start(self):
 
-        self.main_window = MainWindow(self.project_root)
+        stock_service = StockService(
+            api_key=DART_API_KEY,
+            cache_dir=CACHE_DIR
+        )
 
-        self.main_window.show()
+        analyzer = StockAnalyzer(stock_service)
+
+        self.main_window = MainWindow(
+            stock_service,
+            analyzer
+        )
+
+        self.main_window.run()

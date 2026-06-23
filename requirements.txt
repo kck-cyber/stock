@@ -15,3 +15,4 @@ reportlab>=4.2.5
 schedule>=1.2.2
 matplotlib>=3.10.0
 mplfinance>=0.12.10b0
+feedparser>=6.0.11
