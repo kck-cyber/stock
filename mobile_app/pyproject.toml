@@ -1,0 +1,30 @@
+[project]
+name = "morning-stock-mobile"
+version = "0.1.0"
+description = "Mobile dashboard for Morning Stock Assistant Pro"
+requires-python = ">=3.12"
+dependencies = [
+    "flet>=0.85.0",
+    "flet",
+    "pandas",
+    "requests",
+    "yfinance",
+    "beautifulsoup4",
+    "lxml",
+    "sqlalchemy"
+]
+
+[tool.flet]
+product = "Morning Stock"
+company = "kck"
+copyright = "Copyright (C) 2026 kck"
+
+[tool.flet.app]
+path = "."
+module = "main"
+
+[tool.flet.android]
+package = "com.kck.morningstock"
+permissions = [
+    "INTERNET",
+]

@@ -1,0 +1,32 @@
+{
+    "AAPL": {
+        "name": "Apple"
+    },
+    "MSFT": {
+        "name": "Microsoft"
+    },
+    "NVDA": {
+        "name": "NVIDIA"
+    },
+    "TSLA": {
+        "name": "Tesla"
+    },
+    "AMD": {
+        "name": "AMD"
+    },
+    "META": {
+        "name": "Meta"
+    },
+    "AMZN": {
+        "name": "Amazon"
+    },
+    "GOOGL": {
+        "name": "Alphabet"
+    },
+    "NFLX": {
+        "name": "Netflix"
+    },
+    "PLTR": {
+        "name": "Palantir"
+    }
+}

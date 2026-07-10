@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: morning-stock-assistant-api
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements-render.txt
+    startCommand: uvicorn server.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.10
+      - key: CACHE_DIR
+        value: /tmp/morning-stock-cache
+      - key: ANALYSIS_YEAR
+        value: "2025"
+      - key: REPORT_CODE
+        value: "11011"

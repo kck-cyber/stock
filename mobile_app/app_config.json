@@ -1,0 +1,19 @@
+﻿{
+    "app_name":  "Morning Stock",
+    "project_name":  "morning_stock_mobile",
+    "artifact_name":  "MorningStockMobile",
+    "description":  "Mobile dashboard for Morning Stock Assistant Pro",
+    "org_name":  "com.kck",
+    "bundle_id":  "com.kck.morningstock",
+    "company_name":  "kck",
+    "build_version":  "0.1.0",
+    "build_number":  "3",
+    "splash_color":  "#f7f8fb",
+    "android_adaptive_icon_background":  "#2563eb",
+    "icon_path":  "assets/icon.png",
+    "adaptive_icon_foreground_path":  "assets/adaptive_icon_foreground.png",
+    "splash_path":  "assets/splash.png",
+    "android_permissions":  [
+
+                            ]
+}
