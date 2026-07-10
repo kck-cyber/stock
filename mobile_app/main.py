@@ -3424,11 +3424,14 @@ class MobileStockApp:
 
         return StockResolver(
             APP_ROOT,
-            search_service_factory=None,
+            search_service_factory=self.search_service_factory,
         )
 
     def search_service_factory(self):
-        raise RuntimeError("모바일 앱에서는 로컬 검색 서비스를 사용하지 않습니다.")
+        if not self.api_base_url:
+            raise RuntimeError("Render 서버 URL이 필요합니다.")
+
+        return RemoteAnalysisClient(self.api_base_url)
 
     def add_group(self, _):
         name = (self.group_name.value or "").strip()

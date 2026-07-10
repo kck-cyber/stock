@@ -20,7 +20,7 @@ if str(SRC_DIR) not in sys.path:
 def make_bridge():
     from morning_stock_assistant.shared import SharedAnalysisBridge
 
-    cache_dir = Path(os.getenv("CACHE_DIR", "/tmp/morning-stock-cache"))
+    cache_dir = Path(os.getenv("CACHE_DIR") or APP_ROOT / "cache")
     return SharedAnalysisBridge(
         api_key=os.getenv("DART_API_KEY", ""),
         cache_dir=cache_dir,
@@ -119,6 +119,54 @@ def news(name: str, limit: int = 5) -> dict[str, Any]:
     return {
         "name": name,
         "items": get_bridge().news_items(name, limit=limit),
+    }
+
+
+@app.get("/search")
+def search(keyword: str, limit: int = 20) -> dict[str, Any]:
+    keyword = str(keyword or "").strip()
+
+    if not keyword:
+        raise HTTPException(status_code=400, detail="keyword is required")
+
+    limit = max(1, min(int(limit), 50))
+
+    try:
+        from morning_stock_assistant.services.search_service import SearchService
+
+        results = SearchService(get_bridge().service.krx).search(keyword)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    normalized = []
+    seen = set()
+
+    for item in results or []:
+        code = str(
+            item.get("code")
+            or item.get("symbol")
+            or item.get("ticker")
+            or ""
+        ).strip().upper()
+        name = str(item.get("name") or item.get("company") or code).strip()
+
+        if not code or code in seen:
+            continue
+
+        seen.add(code)
+        normalized.append({
+            "code": code,
+            "name": name or code,
+            "market": item.get("market") or ("국내" if code.isdigit() else "해외"),
+        })
+
+        if len(normalized) >= limit:
+            break
+
+    return {
+        "keyword": keyword,
+        "results": normalized,
+        "count": len(normalized),
     }
 
 

@@ -64,6 +64,19 @@ class RemoteAnalysisClient:
     def health(self) -> dict[str, Any]:
         return self._get_json("/health")
 
+    def search(self, keyword: str, limit: int = 20) -> list[dict[str, Any]]:
+        query = urllib.parse.urlencode({
+            "keyword": keyword,
+            "limit": limit,
+        })
+        data = self._get_json(f"/search?{query}")
+        results = data.get("results", [])
+
+        if not isinstance(results, list):
+            return []
+
+        return results
+
     def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         self._ensure_enabled()
         request = urllib.request.Request(
