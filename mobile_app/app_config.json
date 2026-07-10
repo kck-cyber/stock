@@ -7,7 +7,7 @@
     "bundle_id":  "com.kck.morningstock",
     "company_name":  "kck",
     "build_version":  "0.1.0",
-    "build_number":  "3",
+    "build_number":  "4",
     "splash_color":  "#f7f8fb",
     "android_adaptive_icon_background":  "#2563eb",
     "icon_path":  "assets/icon.png",

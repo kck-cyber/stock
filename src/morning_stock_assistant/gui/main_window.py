@@ -2293,20 +2293,50 @@ class MainWindow:
     def result_from_remote_record(self, record, preset):
 
         finance = record.get("finance") or {}
+        factor_scores = record.get("factor_scores") or {}
         news_score = safe_number(record.get("news_score", 50))
         raw_news = ((news_score / 100) * 40) - 20
+        score_breakdown = [
+            {
+                "name": name.title(),
+                "raw_score": safe_number(score),
+                "original_score": safe_number(score),
+                "weight": {
+                    "value": 0.20,
+                    "quality": 0.25,
+                    "growth": 0.20,
+                    "stability": 0.15,
+                    "momentum": 0.15,
+                    "dividend": 0.05,
+                }.get(name, 0),
+                "contribution": round(
+                    safe_number(score)
+                    * {
+                        "value": 0.20,
+                        "quality": 0.25,
+                        "growth": 0.20,
+                        "stability": 0.15,
+                        "momentum": 0.15,
+                        "dividend": 0.05,
+                    }.get(name, 0),
+                    2,
+                ),
+                "reasons": [],
+            }
+            for name, score in factor_scores.items()
+        ]
 
         fields = {
             "code": str(record.get("code", "")).upper(),
             "name": record.get("name") or record.get("code", ""),
             "score": safe_number(record.get("final_score", 0)),
             "signal": record.get("signal") or record.get("grade") or "-",
-            "value": 0,
-            "quality": 0,
-            "growth": 0,
-            "stability": 0,
-            "dividend": 0,
-            "momentum": 0,
+            "value": safe_number(factor_scores.get("value", 0)),
+            "quality": safe_number(factor_scores.get("quality", 0)),
+            "growth": safe_number(factor_scores.get("growth", 0)),
+            "stability": safe_number(factor_scores.get("stability", 0)),
+            "dividend": safe_number(factor_scores.get("dividend", 0)),
+            "momentum": safe_number(factor_scores.get("momentum", 0)),
             "roe": safe_number(finance.get("roe", 0)),
             "debt_ratio": safe_number(finance.get("debt_ratio", 0)),
             "net_income": safe_number(finance.get("net_income", 0)),
@@ -2359,7 +2389,10 @@ class MainWindow:
             "price_date": record.get("price_date", ""),
             "analyst_target_mean": safe_number(record.get("target_price", 0)),
             "analyst_recommendation": record.get("analyst", ""),
-            "score_breakdown": [],
+            "score_breakdown": score_breakdown,
+            "factor_scores": factor_scores,
+            "score_reason": record.get("score_reason", ""),
+            "score_adjustments": record.get("score_adjustments", []),
             "preset": preset,
             "remote_record": record,
             "remote_source": True,

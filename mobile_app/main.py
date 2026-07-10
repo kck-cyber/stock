@@ -18,6 +18,7 @@ DEV_STORAGE_DIR = APP_ROOT / "storage"
 DEV_WATCHLIST_FILE = DEV_STORAGE_DIR / "watchlist.json"
 DEV_HOLDINGS_FILE = DEV_STORAGE_DIR / "holdings.json"
 APP_CONFIG_FILE = Path(__file__).resolve().parent / "app_config.json"
+DEFAULT_SERVER_URL = "https://stock-z1su.onrender.com"
 
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
@@ -80,7 +81,7 @@ class MobileStockApp:
         self.real_data_loaded_at = ""
         self.real_data_error = ""
         self.api_base_url = str(
-            self.app_settings.get("api_base_url", "")
+            self.app_settings.get("api_base_url", DEFAULT_SERVER_URL)
         ).strip()
         self.alerts = []
         self.alert_history = set()
@@ -1430,6 +1431,8 @@ class MobileStockApp:
         real_line = self.stock_detail_text(real)
         target = self.target_text(real)
         analyst = real.get("analyst") if real else ""
+        score_reason = real.get("score_reason", "") if real else ""
+        factor_text = self.factor_score_text(real) if real else ""
         comment = (
             real.get("comment")
             if real
@@ -1457,6 +1460,16 @@ class MobileStockApp:
                         f"{market} | 퀀트 {quant_score:.1f} | 뉴스 {news_score:.1f} | 평균 {final_score:.1f}",
                         size=12,
                         color="#64748b",
+                    ),
+                    *(
+                        [ft.Text(score_reason, size=11, color="#475569")]
+                        if score_reason
+                        else []
+                    ),
+                    *(
+                        [ft.Text(factor_text, size=11, color="#64748b")]
+                        if factor_text
+                        else []
                     ),
                     *(
                         [ft.Text(real_line, size=12, color="#64748b")]
@@ -1499,6 +1512,30 @@ class MobileStockApp:
             ),
             padding=13,
         )
+
+    def factor_score_text(self, record):
+        factor_scores = (record or {}).get("factor_scores") or {}
+
+        if not factor_scores:
+            return ""
+
+        labels = {
+            "value": "가치",
+            "quality": "품질",
+            "growth": "성장",
+            "stability": "안정",
+            "momentum": "추세",
+            "dividend": "배당",
+        }
+        parts = []
+
+        for key in ["value", "quality", "growth", "stability", "momentum", "dividend"]:
+            if key in factor_scores:
+                parts.append(
+                    f"{labels[key]} {safe_number(factor_scores.get(key, 0)):.1f}"
+                )
+
+        return "팩터 | " + " · ".join(parts) if parts else ""
 
     def briefing_comment(self, quant_score, news_score, final_score):
         if final_score >= 85:
@@ -2503,7 +2540,7 @@ class MobileStockApp:
                     ft.Row(
                         [
                             self.primary_button("서버 설정 저장", self.save_server_settings),
-                            self.secondary_button("로컬 사용", self.clear_server_settings),
+                            self.secondary_button("기본 서버", self.clear_server_settings),
                         ],
                         spacing=8,
                     ),
@@ -3152,6 +3189,9 @@ class MobileStockApp:
     def save_server_settings(self, _=None):
         value = str(self.api_base_url_input.value or "").strip().rstrip("/")
 
+        if not value:
+            value = DEFAULT_SERVER_URL
+
         if value and not value.startswith(("http://", "https://")):
             self.snack("서버 URL은 https:// 로 시작해야 합니다.")
             return
@@ -3162,10 +3202,10 @@ class MobileStockApp:
         self.render()
 
     def clear_server_settings(self, _=None):
-        self.api_base_url = ""
-        self.api_base_url_input.value = ""
+        self.api_base_url = DEFAULT_SERVER_URL
+        self.api_base_url_input.value = DEFAULT_SERVER_URL
         self.save_app_settings()
-        self.snack("로컬 분석을 사용하도록 변경했습니다.")
+        self.snack("기본 서버 주소로 되돌렸습니다.")
         self.render()
 
     def save_alert_settings(self, _=None):
@@ -3373,19 +3413,11 @@ class MobileStockApp:
 
         return StockResolver(
             APP_ROOT,
-            search_service_factory=self.search_service_factory,
+            search_service_factory=None,
         )
 
     def search_service_factory(self):
-        bridge = self.get_bridge()
-        krx = getattr(bridge.service, "krx", None)
-
-        if krx is None:
-            raise RuntimeError("KRX collector is not available")
-
-        from morning_stock_assistant.services.search_service import SearchService
-
-        return SearchService(krx)
+        raise RuntimeError("모바일 앱에서는 로컬 검색 서비스를 사용하지 않습니다.")
 
     def add_group(self, _):
         name = (self.group_name.value or "").strip()
@@ -3582,25 +3614,20 @@ class MobileStockApp:
                     self.analysis_done = len(stocks)
                     self.analysis_current = "서버 분석 완료"
                 except Exception as remote_exc:
-                    self.analysis_loading_message = (
-                        f"서버 실패, 로컬 분석으로 전환... {remote_exc}"
-                    )
+                    self.analysis_loading_message = f"서버 분석 실패: {remote_exc}"
                     self.update_visible_analysis_status()
+                    raise RuntimeError(
+                        f"서버 분석 실패: {remote_exc}"
+                    ) from remote_exc
+            else:
+                raise RuntimeError(
+                    "Render 서버 URL이 필요합니다. 설정에서 서버 주소를 입력하세요."
+                )
 
             if records is None:
-                bridge = self.get_bridge()
-                self.analysis_loading_message = f"{source} 분석 중... 0/{len(stocks)}"
-                self.update_visible_analysis_status()
-                records = bridge.build_records(
-                    stocks,
-                    holdings=self.holdings,
-                    preset="균형형",
-                    analyze=True,
-                    progress_callback=lambda index, total, name, code: (
-                        self.on_analysis_progress(index, total, name, code, source)
-                    ),
+                raise RuntimeError(
+                    "서버에서 분석 결과를 받지 못했습니다."
                 )
-                source_label = f"{source}/로컬"
 
         except Exception as exc:
             self.real_data_error = str(exc)
@@ -3697,15 +3724,9 @@ class MobileStockApp:
             self.update_visible_analysis_status()
 
     def get_bridge(self):
-        if self.bridge is None:
-            from morning_stock_assistant.shared import SharedAnalysisBridge
-
-            self.bridge = SharedAnalysisBridge(
-                api_key="",
-                cache_dir=APP_ROOT / "cache",
-            )
-
-        return self.bridge
+        raise RuntimeError(
+            "모바일 앱에서는 로컬 분석을 사용하지 않습니다. Render 서버 URL을 설정하세요."
+        )
 
     def reload_data(self):
         if self.analysis_loading:

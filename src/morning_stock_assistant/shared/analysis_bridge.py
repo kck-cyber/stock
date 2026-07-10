@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,6 +15,25 @@ def safe_number(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+FACTOR_MAX = {
+    "value": 100,
+    "quality": 130,
+    "growth": 60,
+    "stability": 20,
+    "dividend": 10,
+    "momentum": 50,
+}
+
+QUANT_WEIGHTS = {
+    "value": 0.20,
+    "quality": 0.25,
+    "growth": 0.20,
+    "stability": 0.15,
+    "momentum": 0.15,
+    "dividend": 0.05,
+}
 
 
 @dataclass
@@ -42,6 +61,9 @@ class BridgeStockRecord:
     comment: str
     news: list[dict[str, Any]]
     finance: dict[str, Any]
+    factor_scores: dict[str, float] = field(default_factory=dict)
+    score_reason: str = ""
+    score_adjustments: list[dict[str, Any]] = field(default_factory=list)
     holding_quantity: float = 0.0
     holding_avg_price: float = 0.0
 
@@ -91,7 +113,12 @@ class SharedAnalysisBridge:
             result = self._analyze(code, preset) if analyze else None
             metrics = self._metrics(code, result)
             holding = holdings.get(code, {})
-            quant_score = self.quant_average_score(result)
+            factor_scores = self.factor_scores(result)
+            score_adjustments = self.quant_adjustments(result, factor_scores)
+            quant_score = self.quant_score_from_components(
+                factor_scores,
+                score_adjustments,
+            )
             news_score = self.news_normalized_score(result)
             final_score = (
                 round((quant_score * 0.7) + (news_score * 0.3), 1)
@@ -132,6 +159,14 @@ class SharedAnalysisBridge:
                     getattr(result, "name", name) if result else name
                 ),
                 finance=self.finance_summary(result),
+                factor_scores=factor_scores,
+                score_reason=self.score_reason(
+                    quant_score,
+                    news_score,
+                    final_score,
+                    score_adjustments,
+                ),
+                score_adjustments=score_adjustments,
                 holding_quantity=safe_number(holding.get("quantity", 0)),
                 holding_avg_price=safe_number(holding.get("avg_price", 0)),
             )
@@ -285,22 +320,160 @@ class SharedAnalysisBridge:
         if result is None:
             return 0.0
 
-        factor_max = {
-            "value": 100,
-            "quality": 130,
-            "growth": 60,
-            "stability": 20,
-            "dividend": 10,
-            "momentum": 50,
-        }
-        scores = []
+        factor_scores = SharedAnalysisBridge.factor_scores(result)
+        score_adjustments = SharedAnalysisBridge.quant_adjustments(
+            result,
+            factor_scores,
+        )
+        return SharedAnalysisBridge.quant_score_from_components(
+            factor_scores,
+            score_adjustments,
+        )
 
-        for name, max_score in factor_max.items():
+    @staticmethod
+    def factor_scores(result) -> dict[str, float]:
+        if result is None:
+            return {name: 0.0 for name in FACTOR_MAX}
+
+        scores: dict[str, float] = {}
+
+        for item in getattr(result, "score_breakdown", []) or []:
+            name = str(item.get("name", "")).strip().lower()
+
+            if name in FACTOR_MAX:
+                scores[name] = round(
+                    max(min(safe_number(item.get("raw_score", 0)), 100), 0),
+                    1,
+                )
+
+        for name, max_score in FACTOR_MAX.items():
+            if name in scores:
+                continue
+
             score = safe_number(getattr(result, name, 0))
             score = max(min(score, max_score), 0)
-            scores.append((score / max_score) * 100)
+            scores[name] = round((score / max_score) * 100, 1)
 
-        return sum(scores) / len(scores)
+        return scores
+
+    @staticmethod
+    def quant_score_from_components(
+        factor_scores: dict[str, float],
+        adjustments: list[dict[str, Any]] | None = None,
+    ) -> float:
+        weighted_score = sum(
+            max(min(safe_number(factor_scores.get(name, 0)), 100), 0) * weight
+            for name, weight in QUANT_WEIGHTS.items()
+        )
+        adjustment_total = sum(
+            safe_number(item.get("points", 0))
+            for item in adjustments or []
+        )
+        adjustment_total = max(min(adjustment_total, 8), -20)
+        return round(max(min(weighted_score + adjustment_total, 100), 0), 1)
+
+    @staticmethod
+    def quant_adjustments(
+        result,
+        factor_scores: dict[str, float],
+    ) -> list[dict[str, Any]]:
+        if result is None:
+            return []
+
+        adjustments: list[dict[str, Any]] = []
+        code = str(getattr(result, "code", "") or "").upper()
+        name = str(getattr(result, "name", "") or "").lower()
+        asset_type = str(getattr(result, "asset_type", "STOCK") or "STOCK").upper()
+        net_income = safe_number(getattr(result, "net_income", 0))
+        price = safe_number(getattr(result, "price", 0))
+        per = safe_number(getattr(result, "per", 0))
+        pbr = safe_number(getattr(result, "pbr", 0))
+        roe = safe_number(getattr(result, "roe", 0))
+        market_cap = safe_number(getattr(result, "market_cap", 0))
+
+        if asset_type == "ETF" or str(getattr(result, "is_etf", "")).lower() == "true":
+            adjustments.append({
+                "type": "asset_type",
+                "points": -6,
+                "reason": "ETF는 개별기업 재무팩터보다 구성자산과 추세가 중요해 보수 조정",
+            })
+
+        if net_income < 0 and asset_type != "ETF":
+            adjustments.append({
+                "type": "loss",
+                "points": -8,
+                "reason": "순이익 적자 기업은 품질/안정성 위험을 추가 반영",
+            })
+
+        if any(keyword in name for keyword in [
+            "bio",
+            "pharma",
+            "therapeutics",
+            "바이오",
+            "제약",
+        ]):
+            adjustments.append({
+                "type": "biotech",
+                "points": -4,
+                "reason": "바이오/제약주는 임상·뉴스 변동성이 커 보수 조정",
+            })
+
+        if (
+            factor_scores.get("growth", 0) >= 70
+            and factor_scores.get("momentum", 0) >= 60
+            and factor_scores.get("value", 0) < 40
+            and asset_type != "ETF"
+        ):
+            adjustments.append({
+                "type": "growth_stock",
+                "points": 4,
+                "reason": "가치점수는 낮지만 성장·모멘텀이 강한 성장주 보정",
+            })
+
+        missing_fundamentals = (
+            per <= 0
+            and pbr <= 0
+            and roe == 0
+            and market_cap <= 0
+        )
+
+        if code and not code.isdigit() and missing_fundamentals and asset_type != "ETF":
+            adjustments.append({
+                "type": "overseas_data",
+                "points": -4,
+                "reason": "해외주식 재무 데이터가 부족해 신뢰도 보수 조정",
+            })
+
+        if price > 0 and price < 10 and asset_type != "ETF":
+            adjustments.append({
+                "type": "speculative_price",
+                "points": -3,
+                "reason": "저가 변동성 종목은 투기성 위험을 일부 반영",
+            })
+
+        return adjustments
+
+    @staticmethod
+    def score_reason(
+        quant_score: float,
+        news_score: float,
+        final_score: float,
+        adjustments: list[dict[str, Any]] | None = None,
+    ) -> str:
+        reason = (
+            f"퀀트 {quant_score:.1f}점, 뉴스 {news_score:.1f}점, "
+            f"최종 {final_score:.1f}점"
+        )
+        labels = [
+            f"{item.get('reason', '')}({safe_number(item.get('points', 0)):+.0f})"
+            for item in adjustments or []
+            if item.get("reason")
+        ]
+
+        if labels:
+            reason += " | 보정: " + "; ".join(labels)
+
+        return reason
 
     @staticmethod
     def news_normalized_score(result) -> float:
