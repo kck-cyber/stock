@@ -72,6 +72,7 @@ class MobileStockApp:
         self.selected_chart_code = first_stock.get("code", "")
         self.selected_holding_code = first_stock.get("code", "")
         self.stock_preview = None
+        self.stock_search_results = []
         self.chart_period = "1개월"
         self.chart_selected_index = None
         self.chart_selected_price = None
@@ -146,7 +147,7 @@ class MobileStockApp:
             border_radius=8,
             margin=ft.Margin(12, 12, 12, 0),
         )
-        self.file_picker = ft.FilePicker()
+        self.file_picker = None
         self.auto_refresh_enabled = bool(
             self.app_settings.get("auto_refresh_enabled", True)
         )
@@ -163,14 +164,14 @@ class MobileStockApp:
             hint_text="예: 005930, NVDA",
             dense=True,
             expand=True,
-            on_submit=self.add_stock,
+            on_submit=self.search_stock_input,
         )
         self.search_name = ft.TextField(
             label="종목명",
             hint_text="예: 삼성전자, 엔비디아, NVIDIA",
             dense=True,
             expand=True,
-            on_submit=self.add_stock,
+            on_submit=self.search_stock_input,
         )
         self.group_name = ft.TextField(
             label="그룹명",
@@ -262,7 +263,7 @@ class MobileStockApp:
         )
         if self.progress_overlay not in self.page.overlay:
             self.page.overlay.append(self.progress_overlay)
-        if self.file_picker not in self.page.overlay:
+        if self.file_picker is not None and self.file_picker not in self.page.overlay:
             self.page.overlay.append(self.file_picker)
         self.render()
         self.start_status_watcher()
@@ -283,7 +284,7 @@ class MobileStockApp:
                 break
 
         if base_path is None:
-            base_path = Path.home() / ".morning_stock_mobile"
+            base_path = Path(__file__).resolve().parent
 
         return base_path / "storage"
 
@@ -1038,8 +1039,8 @@ class MobileStockApp:
                             ),
                             ft.Row(
                                 [
-                                    self.primary_button("추가", self.add_stock),
-                                    self.secondary_button("미리보기", self.preview_stock_input),
+                                    self.primary_button("검색", self.search_stock_input),
+                                    self.secondary_button("직접 추가", self.add_stock),
                                     self.secondary_button(
                                         "새로고침",
                                         lambda _: self.reload_data(),
@@ -1047,7 +1048,7 @@ class MobileStockApp:
                                 ],
                                 spacing=8,
                             ),
-                            self.stock_preview_panel(),
+                            self.stock_search_results_panel(),
                         ],
                         spacing=10,
                     )
@@ -1137,6 +1138,78 @@ class MobileStockApp:
                         if ok
                         else []
                     ),
+                ],
+                spacing=8,
+            ),
+            padding=12,
+            border_radius=10,
+            bgcolor="#f8fafc",
+        )
+
+    def stock_search_results_panel(self):
+        if not self.stock_search_results:
+            return ft.Container(height=0)
+
+        rows = []
+
+        for result in self.stock_search_results[:12]:
+            code = result.get("code", "")
+            name = result.get("name") or code
+            market = result.get("market") or ("국내" if str(code).isdigit() else "해외")
+            duplicate = any(
+                item.get("code") == code
+                for item in self.groups.get(self.selected_group, [])
+            )
+
+            rows.append(
+                ft.Container(
+                    content=ft.Row(
+                        [
+                            ft.Column(
+                                [
+                                    ft.Text(
+                                        name,
+                                        weight=ft.FontWeight.BOLD,
+                                        color="#0f172a",
+                                    ),
+                                    ft.Text(
+                                        f"{code} | {market}",
+                                        size=12,
+                                        color="#64748b",
+                                    ),
+                                ],
+                                spacing=2,
+                                expand=True,
+                            ),
+                            (
+                                ft.Text("추가됨", size=12, color="#94a3b8")
+                                if duplicate
+                                else self.secondary_button(
+                                    "추가",
+                                    lambda _, item=result: self.add_search_result_stock(item),
+                                )
+                            ),
+                        ],
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    padding=10,
+                    border_radius=8,
+                    bgcolor="#ffffff",
+                )
+            )
+
+        return ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Text("검색 결과", weight=ft.FontWeight.BOLD, expand=True),
+                            self.secondary_button("닫기", self.clear_stock_search_results),
+                        ],
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    ft.Column(rows, spacing=6),
                 ],
                 spacing=8,
             ),
@@ -2493,13 +2566,11 @@ class MobileStockApp:
                             self.analysis_status_panel(),
                             self.auto_refresh_panel(),
                             self.alert_settings_panel(),
-                            self.backup_panel(),
                             ft.Divider(),
                             ft.Text("파일 상태", weight=ft.FontWeight.BOLD),
                             self.file_status_row("관심종목", self.watchlist_file),
                             self.file_status_row("보유종목", self.holdings_file),
                             self.file_status_row("앱 설정", self.settings_file),
-                            self.file_status_row("백업 폴더", self.backup_dir),
                             ft.Divider(),
                             ft.Text("완성 단계", weight=ft.FontWeight.BOLD),
                             ft.Text("1. 관심종목/보유종목 읽기 및 저장 완료", color="#334155"),
@@ -2674,7 +2745,6 @@ class MobileStockApp:
     def app_health_checks(self):
         stock_count = sum(len(items) for items in self.groups.values())
         holding_count = len(self.holdings)
-        latest_backup = self.latest_backup_file()
         stale_count = sum(
             1 for record in self.real_records.values()
             if safe_number(record.get("freshness_days", -1), -1) >= 3
@@ -2715,13 +2785,6 @@ class MobileStockApp:
             "level": "watch" if unknown_date_count else "good",
             "hint": "일부 종목은 데이터 제공처가 기준일을 주지 않을 수 있습니다.",
         })
-        checks.append({
-            "label": "최근 백업",
-            "value": latest_backup.name if latest_backup else "없음",
-            "level": "good" if latest_backup else "watch",
-            "hint": "업데이트 전 백업을 만들어두면 안전합니다.",
-        })
-
         return checks
 
     def health_check_row(self, item):
@@ -3350,7 +3413,74 @@ class MobileStockApp:
         self.search_name.value = ""
         self.search_code.value = ""
         self.stock_preview = None
+        self.stock_search_results = []
         self.snack("관심종목을 추가했습니다.")
+        self.render()
+
+    def search_stock_input(self, _=None):
+        name = (self.search_name.value or "").strip()
+        code = (self.search_code.value or "").strip().upper()
+        keyword = code or name
+
+        if not keyword:
+            self.snack("검색할 종목명이나 종목 코드를 입력하세요.")
+            return
+
+        results = []
+
+        try:
+            results = self.search_service_factory().search(keyword, limit=12)
+        except Exception:
+            results = []
+
+        if not results:
+            resolved = self.resolve_stock_input(name, code)
+
+            if resolved:
+                results = [{
+                    "name": resolved.get("name") or resolved.get("code", ""),
+                    "code": resolved.get("code", ""),
+                    "market": "국내" if str(resolved.get("code", "")).isdigit() else "해외",
+                }]
+
+        normalized = []
+        seen = set()
+
+        for item in results or []:
+            item_code = self.normalize_stock_code(
+                item.get("code")
+                or item.get("symbol")
+                or item.get("ticker")
+                or ""
+            )
+            item_name = item.get("name") or item.get("company") or item_code
+
+            if not item_code or item_code in seen:
+                continue
+
+            seen.add(item_code)
+            normalized.append({
+                "name": item_name,
+                "code": item_code,
+                "market": item.get("market")
+                or ("국내" if item_code.isdigit() else "해외"),
+            })
+
+        self.stock_search_results = normalized
+        self.stock_preview = None
+
+        if not normalized:
+            self.snack("검색 결과가 없습니다.")
+
+        self.render()
+
+    def add_search_result_stock(self, item):
+        self.search_name.value = item.get("name", "")
+        self.search_code.value = item.get("code", "")
+        self.add_stock(None)
+
+    def clear_stock_search_results(self, _=None):
+        self.stock_search_results = []
         self.render()
 
     def preview_stock_input(self, _=None):
