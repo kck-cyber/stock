@@ -1679,6 +1679,7 @@ class MainWindow:
 
         if self.remote_client().enabled:
             try:
+                self.show_server_connecting("서버")
                 stock_name = self.current_stock
 
                 if self.current_group:
@@ -2253,6 +2254,15 @@ class MainWindow:
     def remote_client(self):
 
         return RemoteAnalysisClient(self.api_base_url_var.get().strip())
+
+    def show_server_connecting(self, label="서버"):
+
+        self.root.after(
+            0,
+            lambda: self.status_var.set(
+                f"{label} 접속 중... Render 서버를 깨우는 중입니다."
+            )
+        )
 
     def analyze_remote_records(self, stocks, preset):
 
@@ -3667,10 +3677,7 @@ class MainWindow:
 
         if self.remote_client().enabled:
             try:
-                self.root.after(
-                    0,
-                    lambda: self.status_var.set("비교표 서버 분석 중...")
-                )
+                self.show_server_connecting("비교표 서버")
                 self.analyze_remote_records(stocks, preset)
                 self.root.after(
                     0,
@@ -4157,6 +4164,7 @@ class MainWindow:
 
             if missing:
                 try:
+                    self.show_server_connecting("브리핑 서버")
                     self.analyze_remote_records(missing, preset)
                 except Exception as e:
                     print("브리핑 서버 분석 오류, 로컬 분석으로 전환:", e)
@@ -4937,10 +4945,7 @@ class MainWindow:
 
         if self.remote_client().enabled:
             try:
-                self.root.after(
-                    0,
-                    lambda: self.status_var.set("포트폴리오 서버 분석 중...")
-                )
+                self.show_server_connecting("포트폴리오 서버")
                 self.analyze_remote_records(stocks, preset)
                 self.root.after(
                     0,
