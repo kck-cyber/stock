@@ -3085,6 +3085,17 @@ class MobileStockApp:
                 except Exception:
                     pass
 
+    def set_analysis_message(self, message, current=None, update_page=True):
+        self.analysis_loading_message = message
+
+        if current is not None:
+            self.analysis_current = current
+
+        self.update_visible_analysis_status()
+
+        if update_page:
+            self.safe_update()
+
     def start_status_watcher(self):
         if self.status_watcher_started:
             return
@@ -3605,10 +3616,15 @@ class MobileStockApp:
 
             if self.api_base_url:
                 try:
-                    self.analysis_loading_message = (
-                        f"{source} 서버 분석 요청 중... 0/{len(stocks)}"
+                    self.set_analysis_message(
+                        f"{source} 서버 접속 중... Render 서버를 깨우는 중입니다. 0/{len(stocks)}",
+                        "서버 접속 중",
                     )
-                    self.update_visible_analysis_status()
+                    self.set_analysis_message(
+                        f"{source} 서버 분석 요청 중... 0/{len(stocks)}",
+                        "서버 분석 요청 중",
+                        update_page=False,
+                    )
                     records = self.load_remote_analysis(stocks)
                     source_label = f"{source}/서버"
                     self.analysis_done = len(stocks)
