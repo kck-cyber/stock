@@ -174,6 +174,7 @@ class MainWindow:
 
         self.load_groups()
 
+        self.start_server_prewarm()
         self.auto_refresh()
         self.check_scheduled_email()
 
@@ -2239,6 +2240,7 @@ class MainWindow:
             return
 
         self.log_alert("알림 설정 저장 완료")
+        self.start_server_prewarm()
         messagebox.showinfo(
             "알림 설정",
             "알림 설정을 저장했습니다."
@@ -2255,6 +2257,31 @@ class MainWindow:
 
         return RemoteAnalysisClient(self.api_base_url_var.get().strip())
 
+    def start_server_prewarm(self):
+
+        client = self.remote_client()
+
+        if not client.enabled:
+            return
+
+        thread = threading.Thread(
+            target=self.server_prewarm_worker,
+            args=(client,),
+            daemon=True
+        )
+        thread.start()
+
+    def server_prewarm_worker(self, client):
+
+        try:
+            client.health()
+            self.root.after(
+                0,
+                lambda: self.status_var.set("Render 서버 준비 완료")
+            )
+        except Exception:
+            pass
+
     def show_server_connecting(self, label="서버"):
 
         self.root.after(
@@ -2266,8 +2293,26 @@ class MainWindow:
 
     def analyze_remote_records(self, stocks, preset):
 
+        missing_stocks = []
+
+        for stock in stocks:
+            code = StockResolver.normalize_code(stock.get("code", ""))
+
+            if not code:
+                continue
+
+            cache_key = (code, "2025", "11011", preset)
+
+            if self.service.analysis_cache.get(cache_key) is None:
+                copied = dict(stock)
+                copied["code"] = code
+                missing_stocks.append(copied)
+
+        if not missing_stocks:
+            return []
+
         records = self.remote_client().build_records(
-            stocks,
+            missing_stocks,
             holdings=self.holdings,
             preset=preset,
             analyze=True,
@@ -2289,13 +2334,24 @@ class MainWindow:
 
     def analyze_one_remote(self, code, name, preset):
 
+        normalized_code = StockResolver.normalize_code(code)
+        cache_key = (normalized_code, "2025", "11011", preset)
+        cached = self.service.analysis_cache.get(cache_key)
+
+        if cached is not None:
+            self.root.after(
+                0,
+                lambda: self.status_var.set("캐시된 분석 결과 사용")
+            )
+            return cached
+
         records = self.analyze_remote_records(
-            [{"code": code, "name": name or code}],
+            [{"code": normalized_code, "name": name or normalized_code}],
             preset
         )
 
         for record in records:
-            if str(record.get("code", "")).upper() == str(code).upper():
+            if str(record.get("code", "")).upper() == str(normalized_code).upper():
                 return self.result_from_remote_record(record, preset)
 
         return None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,8 @@ app.add_middleware(
 )
 
 bridge = None
+records_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+RECORDS_CACHE_TTL_SECONDS = 600
 
 
 def get_bridge():
@@ -51,6 +54,56 @@ def get_bridge():
         bridge = make_bridge()
 
     return bridge
+
+
+def cache_key_for_records(payload: dict[str, Any], max_workers: int) -> str:
+    key_payload = {
+        "stocks": payload.get("stocks") or [],
+        "holdings": payload.get("holdings") or {},
+        "preset": str(payload.get("preset") or "균형형"),
+        "analyze": bool(payload.get("analyze", True)),
+        "max_workers": max_workers,
+    }
+    return json_dumps_for_cache(key_payload)
+
+
+def json_dumps_for_cache(value: Any) -> str:
+    import json
+
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def get_records_cache(key: str) -> dict[str, Any] | None:
+    cached = records_cache.get(key)
+
+    if not cached:
+        return None
+
+    created_at, value = cached
+
+    if time.time() - created_at > RECORDS_CACHE_TTL_SECONDS:
+        records_cache.pop(key, None)
+        return None
+
+    copied = dict(value)
+    copied["cached"] = True
+    return copied
+
+
+def set_records_cache(key: str, value: dict[str, Any]) -> None:
+    if len(records_cache) > 200:
+        oldest_key = min(
+            records_cache,
+            key=lambda item: records_cache[item][0],
+        )
+        records_cache.pop(oldest_key, None)
+
+    records_cache[key] = (time.time(), dict(value))
 
 
 @app.get("/")
@@ -83,6 +136,11 @@ def records(payload: dict[str, Any]) -> dict[str, Any]:
     analyze = bool(payload.get("analyze", True))
     max_workers = int(payload.get("max_workers") or 4)
     max_workers = max(1, min(max_workers, 6))
+    cache_key = cache_key_for_records(payload, max_workers)
+    cached = get_records_cache(cache_key)
+
+    if cached is not None:
+        return cached
 
     try:
         result = get_bridge().build_records(
@@ -95,11 +153,14 @@ def records(payload: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    return {
+    response = {
         "records": result,
         "count": len(result),
         "loaded_at": f"{datetime.now():%Y-%m-%d %H:%M}",
+        "cached": False,
     }
+    set_records_cache(cache_key, response)
+    return response
 
 
 @app.get("/api/chart/{code}")
