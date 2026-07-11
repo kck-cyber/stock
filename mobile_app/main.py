@@ -284,7 +284,7 @@ class MobileStockApp:
                 break
 
         if base_path is None:
-            base_path = Path(__file__).resolve().parent
+            base_path = Path.home() / ".morning_stock_mobile"
 
         return base_path / "storage"
 
@@ -294,20 +294,50 @@ class MobileStockApp:
 
         self.storage_dir.mkdir(parents=True, exist_ok=True)
 
-        pairs = [
-            (DEV_WATCHLIST_FILE, self.watchlist_file),
-            (DEV_HOLDINGS_FILE, self.holdings_file),
+        storage_sources = [
+            Path(__file__).resolve().parent / "storage",
+            Path.home() / ".morning_stock_mobile" / "storage",
+            DEV_STORAGE_DIR,
         ]
 
-        for source, target in pairs:
-            if source.exists() and not target.exists():
-                try:
-                    target.write_text(
-                        source.read_text(encoding="utf-8"),
-                        encoding="utf-8",
-                    )
-                except Exception:
-                    pass
+        file_pairs = [
+            ("watchlist.json", self.watchlist_file),
+            ("holdings.json", self.holdings_file),
+            ("app_settings.json", self.settings_file),
+        ]
+
+        for source_dir in storage_sources:
+            try:
+                if source_dir.resolve() == self.storage_dir.resolve():
+                    continue
+            except Exception:
+                pass
+
+            for file_name, target in file_pairs:
+                self.copy_json_if_useful(source_dir / file_name, target)
+
+    def copy_json_if_useful(self, source: Path, target: Path):
+        if not source.exists():
+            return
+
+        try:
+            source_data = load_json(source, None)
+
+            if not source_data:
+                return
+
+            target_data = load_json(target, None) if target.exists() else None
+
+            if target_data:
+                return
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                source.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
 
     def storage_mode_label(self):
         if self.storage_dir == DEV_STORAGE_DIR:
