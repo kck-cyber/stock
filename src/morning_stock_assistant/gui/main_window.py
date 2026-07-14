@@ -36,10 +36,11 @@ from tkinter import ttk
 from morning_stock_assistant import __version__ as APP_VERSION
 from morning_stock_assistant.services.search_service import SearchService
 from morning_stock_assistant.shared.alert_engine import AlertEngine, AlertRules
+from morning_stock_assistant.shared.analysis_bridge import SharedAnalysisBridge
 from morning_stock_assistant.shared.remote_client import RemoteAnalysisClient
 from morning_stock_assistant.shared.stock_resolver import StockResolver
 from morning_stock_assistant.gui.panels.chart_panel import ChartPanel
-from morning_stock_assistant.config import REPORT_DIR
+from morning_stock_assistant.config import DEFAULT_ANALYSIS_SERVER_URL, REPORT_DIR
 
 
 logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
@@ -130,13 +131,14 @@ class MainWindow:
         self.alert_threshold_var = tk.StringVar(value="75")
         self.scheduled_email_var = tk.BooleanVar(value=False)
         self.scheduled_time_var = tk.StringVar(value="08:30")
+        self.auto_refresh_interval_var = tk.StringVar(value="20")
         self.alert_recipient_var = tk.StringVar(value="")
         self.smtp_host_var = tk.StringVar(value="smtp.gmail.com")
         self.smtp_port_var = tk.StringVar(value="587")
         self.smtp_user_var = tk.StringVar(value="")
         self.smtp_password_var = tk.StringVar(value="")
         self.smtp_tls_var = tk.BooleanVar(value=True)
-        self.api_base_url_var = tk.StringVar(value="")
+        self.api_base_url_var = tk.StringVar(value=DEFAULT_ANALYSIS_SERVER_URL)
         self.us_price_krw_var = tk.BooleanVar(value=False)
         self.usd_krw_rate = None
         self.usd_krw_rate_time = None
@@ -148,6 +150,8 @@ class MainWindow:
         self.alert_history = set()
         self.compare_analysis_running = False
         self.portfolio_analysis_running = False
+        self.stock_analysis_running = False
+        self.stock_analysis_code = None
         self.last_scheduled_email_date = None
 
         self.watchlist_file = (
@@ -607,6 +611,7 @@ class MainWindow:
         self.chart_tab = tk.Frame(self.notebook)
         self.news_tab = tk.Frame(self.notebook)
         self.finance_tab = tk.Frame(self.notebook)
+        self.scenario_tab = tk.Frame(self.notebook)
         self.compare_tab = tk.Frame(self.notebook)
         self.portfolio_tab = tk.Frame(self.notebook)
         self.alert_tab = tk.Frame(self.notebook)
@@ -617,6 +622,7 @@ class MainWindow:
         self.notebook.add(self.chart_tab, text="차트")
         self.notebook.add(self.news_tab, text="뉴스")
         self.notebook.add(self.finance_tab, text="재무")
+        self.notebook.add(self.scenario_tab, text="시나리오")
         self.notebook.add(self.compare_tab, text="비교")
         self.notebook.add(self.portfolio_tab, text="포트폴리오")
         self.notebook.add(self.alert_tab, text="알림")
@@ -644,10 +650,11 @@ class MainWindow:
 
         for label, period, interval in (
             ("일일", "1d", "5s"),
-            ("1개월", "1mo", "1d"),
-            ("3개월", "3mo", "1wk"),
-            ("6개월", "6mo", "2wk"),
-            ("1년", "1y", "1mo"),
+            ("일주", "5d", "5m"),
+            ("한달", "1mo", "30m"),
+            ("3개월", "3mo", "1d"),
+            ("6개월", "6mo", "1d"),
+            ("1년", "1y", "1d"),
         ):
             tk.Button(
                 chart_toolbar,
@@ -748,6 +755,12 @@ class MainWindow:
             wrap="word"
         )
         self.finance_text.pack(fill="both", expand=True)
+
+        self.scenario_text = tk.Text(
+            self.scenario_tab,
+            wrap="word"
+        )
+        self.scenario_text.pack(fill="both", expand=True)
 
         compare_toolbar = tk.Frame(self.compare_tab)
         compare_toolbar.pack(fill="x", pady=(0, 4))
@@ -930,7 +943,8 @@ class MainWindow:
         tk.Label(
             self.portfolio_tab,
             textvariable=self.portfolio_summary_var,
-            anchor="w"
+            anchor="w",
+            justify="left"
         ).pack(fill="x", pady=(0, 4))
         tk.Label(
             self.portfolio_tab,
@@ -1038,6 +1052,202 @@ class MainWindow:
 
         self._build_alert_tab()
         self.style_widget_tree()
+
+    def _build_pc_side_menu(self):
+
+        tk.Label(
+            self.pc_side_menu,
+            text="화면 메뉴",
+            bg=self.colors["panel_alt"],
+            fg=self.colors["text"],
+            font=("맑은 고딕", 11, "bold")
+        ).pack(fill="x", pady=(0, 8))
+
+        menu_items = [
+            ("대시보드", self.dashboard_tab),
+            ("보유 종목", self.portfolio_tab),
+            ("종목 분석", self.detail_tab),
+            ("뉴스", self.news_tab),
+            ("이벤트", self.event_tab),
+            ("전략/메모", self.strategy_tab),
+            ("설정", self.alert_tab),
+        ]
+
+        for label, tab in menu_items:
+            tk.Button(
+                self.pc_side_menu,
+                text=label,
+                anchor="w",
+                command=lambda target=tab: self.select_pc_tab(target)
+            ).pack(fill="x", pady=2)
+
+    def select_pc_tab(self, tab):
+
+        try:
+            self.notebook.select(tab)
+        except tk.TclError:
+            pass
+
+        if tab is self.detail_tab:
+            self.refresh_detail_tab()
+        elif tab is self.event_tab:
+            self.refresh_event_tab()
+        elif tab is self.strategy_tab:
+            self.refresh_strategy_tab()
+        elif tab is self.dashboard_tab:
+            self.refresh_dashboard()
+
+    def _build_pc_right_summary(self):
+
+        tk.Label(
+            self.pc_right_summary,
+            text="요약 패널",
+            bg=self.colors["panel"],
+            fg=self.colors["text"],
+            font=("맑은 고딕", 11, "bold")
+        ).pack(anchor="w")
+
+        self.pc_summary_vars = {}
+
+        for key, label in (
+            ("value", "총 평가금액"),
+            ("pnl", "총 손익"),
+            ("risk", "포트폴리오 위험도"),
+            ("attention", "관심 필요"),
+            ("upside", "상승 후보"),
+            ("danger", "위험 증가"),
+            ("events", "중요 이벤트"),
+        ):
+            frame = tk.Frame(self.pc_right_summary, bg=self.colors["panel"])
+            frame.pack(fill="x", pady=(8, 0))
+            tk.Label(
+                frame,
+                text=label,
+                bg=self.colors["panel"],
+                fg=self.colors["muted"],
+                anchor="w"
+            ).pack(fill="x")
+            var = tk.StringVar(value="-")
+            tk.Label(
+                frame,
+                textvariable=var,
+                bg=self.colors["panel"],
+                fg=self.colors["text"],
+                font=("맑은 고딕", 12, "bold"),
+                anchor="w"
+            ).pack(fill="x")
+            self.pc_summary_vars[key] = var
+
+        self.pc_summary_message = tk.Text(
+            self.pc_right_summary,
+            height=8,
+            wrap="word",
+            relief="solid",
+            borderwidth=1
+        )
+        self.pc_summary_message.pack(fill="both", expand=True, pady=(10, 0))
+        self.pc_summary_message.insert(
+            tk.END,
+            "종목을 분석하면 요약과 위험 신호가 표시됩니다."
+        )
+        self.pc_summary_message.configure(state="disabled")
+
+    def _build_detail_tab(self):
+
+        self.detail_summary_var = tk.StringVar(
+            value="종목을 선택하면 상세 요약이 표시됩니다."
+        )
+        tk.Label(
+            self.detail_tab,
+            textvariable=self.detail_summary_var,
+            anchor="w",
+            justify="left",
+            font=("맑은 고딕", 10, "bold")
+        ).pack(fill="x", pady=(0, 6))
+
+        self.detail_notebook = ttk.Notebook(self.detail_tab)
+        self.detail_notebook.pack(fill="both", expand=True)
+
+        self.detail_summary_tab = tk.Frame(self.detail_notebook)
+        self.detail_chart_tab = tk.Frame(self.detail_notebook)
+        self.detail_score_tab = tk.Frame(self.detail_notebook)
+        self.detail_news_tab = tk.Frame(self.detail_notebook)
+        self.detail_strategy_tab = tk.Frame(self.detail_notebook)
+        self.detail_event_tab = tk.Frame(self.detail_notebook)
+        self.detail_history_tab = tk.Frame(self.detail_notebook)
+
+        for tab, title in (
+            (self.detail_summary_tab, "요약"),
+            (self.detail_chart_tab, "차트"),
+            (self.detail_score_tab, "점수"),
+            (self.detail_news_tab, "뉴스"),
+            (self.detail_strategy_tab, "전략"),
+            (self.detail_event_tab, "이벤트"),
+            (self.detail_history_tab, "기록"),
+        ):
+            self.detail_notebook.add(tab, text=title)
+
+        self.detail_summary_text = tk.Text(self.detail_summary_tab, wrap="word")
+        self.detail_summary_text.pack(fill="both", expand=True)
+
+        self.detail_score_text = tk.Text(self.detail_score_tab, wrap="word")
+        self.detail_score_text.pack(fill="both", expand=True)
+
+        self.detail_news_tree = ttk.Treeview(
+            self.detail_news_tab,
+            columns=("date", "impact", "title"),
+            show="headings"
+        )
+        for column, title, width in (
+            ("date", "날짜", 120),
+            ("impact", "호재/악재", 90),
+            ("title", "뉴스 제목", 520),
+        ):
+            self.detail_news_tree.heading(column, text=title)
+            self.detail_news_tree.column(
+                column,
+                width=width,
+                anchor="w" if column == "title" else "center"
+            )
+        self.detail_news_tree.pack(fill="both", expand=True)
+
+        self.detail_strategy_text = tk.Text(self.detail_strategy_tab, wrap="word")
+        self.detail_strategy_text.pack(fill="both", expand=True)
+
+        self.detail_event_text = tk.Text(self.detail_event_tab, wrap="word")
+        self.detail_event_text.pack(fill="both", expand=True)
+
+        self.detail_history_text = tk.Text(self.detail_history_tab, wrap="word")
+        self.detail_history_text.pack(fill="both", expand=True)
+
+        tk.Label(
+            self.detail_chart_tab,
+            text="차트는 상단 메뉴의 차트 화면과 동일한 데이터를 사용합니다. 종목 선택 후 차트 탭을 확인하세요.",
+            anchor="w",
+            justify="left"
+        ).pack(fill="x", pady=6)
+
+    def _build_event_tab(self):
+
+        tk.Label(
+            self.event_tab,
+            text="이벤트 캘린더",
+            font=("맑은 고딕", 11, "bold")
+        ).pack(anchor="w", pady=(0, 6))
+        self.event_text = tk.Text(self.event_tab, wrap="word")
+        self.event_text.pack(fill="both", expand=True)
+        self.refresh_event_tab()
+
+    def _build_strategy_tab(self):
+
+        tk.Label(
+            self.strategy_tab,
+            text="전략 / 메모",
+            font=("맑은 고딕", 11, "bold")
+        ).pack(anchor="w", pady=(0, 6))
+        self.strategy_text = tk.Text(self.strategy_tab, wrap="word")
+        self.strategy_text.pack(fill="both", expand=True)
+        self.refresh_strategy_tab()
 
     def bind_horizontal_tree_drag(self, tree):
 
@@ -1450,7 +1660,7 @@ class MainWindow:
             variable=self.smtp_tls_var
         ).grid(row=6, column=0, sticky="w", pady=(8, 0))
 
-        tk.Label(alert_frame, text="Render 서버 URL").grid(
+        tk.Label(alert_frame, text="분석 서버 URL").grid(
             row=7,
             column=0,
             sticky="w",
@@ -1477,6 +1687,29 @@ class MainWindow:
             columnspan=4,
             sticky="w",
             pady=(2, 0)
+        )
+
+        tk.Label(alert_frame, text="자동 새로고침(분)").grid(
+            row=9,
+            column=0,
+            sticky="w",
+            pady=(8, 0)
+        )
+        tk.Entry(
+            alert_frame,
+            textvariable=self.auto_refresh_interval_var,
+            width=8
+        ).grid(row=9, column=1, sticky="w", pady=(8, 0))
+        tk.Label(
+            alert_frame,
+            text="기본값 20분, 1분 이상 입력",
+            fg=self.colors["muted"]
+        ).grid(
+            row=9,
+            column=2,
+            columnspan=2,
+            sticky="w",
+            pady=(8, 0)
         )
 
         button_frame = tk.Frame(self.alert_tab)
@@ -1651,6 +1884,23 @@ class MainWindow:
         if not self.current_stock:
             return
 
+        if self.stock_analysis_running:
+            self.status_var.set(
+                f"{self.stock_analysis_code or '종목'} 분석 중입니다..."
+            )
+            return
+
+        stock_code = self.current_stock
+        stock_name = stock_code
+
+        if self.current_group:
+            for stock in self.groups.get(self.current_group, []):
+                if stock.get("code") == stock_code:
+                    stock_name = stock.get("name", stock_code)
+                    break
+
+        self.stock_analysis_running = True
+        self.stock_analysis_code = stock_code
         self.result_text.delete("1.0", tk.END)
         self.result_text.insert(
             tk.END,
@@ -1659,6 +1909,8 @@ class MainWindow:
 
         if hasattr(self, "finance_text"):
             self.finance_text.delete("1.0", tk.END)
+        if hasattr(self, "scenario_text"):
+            self.scenario_text.delete("1.0", tk.END)
 
         if hasattr(self, "news_list"):
             for item in self.news_list.get_children():
@@ -1668,29 +1920,22 @@ class MainWindow:
 
         thread = threading.Thread(
             target=self.run_analysis,
-            args=(preset,),
+            args=(preset, stock_code, stock_name),
             daemon=True
         )
 
         thread.start()
 
-    def run_analysis(self, preset):
+    def run_analysis(self, preset, stock_code, stock_name):
 
         result = None
 
         if self.remote_client().enabled:
             try:
                 self.show_server_connecting("서버")
-                stock_name = self.current_stock
-
-                if self.current_group:
-                    for stock in self.groups.get(self.current_group, []):
-                        if stock.get("code") == self.current_stock:
-                            stock_name = stock.get("name", self.current_stock)
-                            break
 
                 result = self.analyze_one_remote(
-                    self.current_stock,
+                    stock_code,
                     stock_name,
                     preset
                 )
@@ -1714,7 +1959,7 @@ class MainWindow:
 
         try:
             result = self.analyzer.analyze(
-                self.current_stock,
+                stock_code,
                 "2025",
                 "11011",
                 preset
@@ -1729,6 +1974,9 @@ class MainWindow:
         )
 
     def analysis_finished(self, result):
+
+        self.stock_analysis_running = False
+        self.stock_analysis_code = None
 
         if result is None:
 
@@ -1747,6 +1995,7 @@ class MainWindow:
         self.refresh_portfolio_table(auto_analyze=False)
         self.refresh_briefing_table()
         self.refresh_dashboard()
+        self.refresh_detail_tab()
         self.handle_analysis_alert(result)
 
         self.status_var.set(
@@ -1776,7 +2025,7 @@ class MainWindow:
 
         quant_score = self.quant_average_score(result)
         news_score = self.news_normalized_score(result)
-        quant_news_average = (quant_score + news_score) / 2
+        final_formula_score = round((quant_score * 0.7) + (news_score * 0.3), 1)
 
         def money(value):
             return self.format_display_price(
@@ -1810,14 +2059,22 @@ class MainWindow:
             "==============================",
             f"{result.name} ({result.code})",
             "==============================",
+            f"상태: {self.daily_status(result, final_formula_score)}",
+            f"오늘 핵심: {self.daily_core(result)}",
+            f"점수: {final_formula_score:.0f}점",
+            f"판단: {self.daily_judgment(result, final_formula_score)}",
             "",
             "[판정]",
             f"가중치 프리셋 : {getattr(result, 'preset', '균형형')}",
             f"투자의견 : {result.signal}",
             f"종합점수 : {number(result.score)}",
-            f"퀀트 평균 : {number(quant_score)}",
-            f"뉴스 환산점수 : {number(news_score)}",
-            f"퀀트+뉴스 평균 : {number(quant_news_average)}",
+            f"퀀트 점수 : {number(quant_score)}",
+            f"뉴스 점수 : {number(news_score)}",
+            f"최종 점수 : {number(final_formula_score)}",
+            "최종 점수 산식 : 퀀트 점수 70% + 뉴스 점수 30%",
+            "",
+            "[매매 기준]",
+            *self.investment_plan_lines(result, quant_score, news_score, final_formula_score),
             "",
             "[현재가]",
             f"현재가 : {money(result.price)}",
@@ -1827,13 +2084,12 @@ class MainWindow:
             f"{number(getattr(result, 'psr', 0))}",
             "",
             "[팩터 점수]",
-            f"Value     : {number(result.value, 1)}",
-            f"Quality   : {number(result.quality, 1)}",
-            f"Growth    : {number(result.growth, 1)}",
-            f"Stability : {number(result.stability, 1)}",
-            f"Dividend  : {number(result.dividend, 1)}",
-            f"Momentum  : {number(result.momentum, 1)}",
-            f"News      : {number(result.news, 1)} "
+            f"가치 점수     : {number(self.factor_score_value(result, 'value'), 1)}",
+            f"품질 점수     : {number(self.factor_score_value(result, 'quality'), 1)}",
+            f"성장 점수     : {number(self.factor_score_value(result, 'growth'), 1)}",
+            f"안정성 점수   : {number(self.factor_score_value(result, 'stability'), 1)}",
+            f"모멘텀 점수   : {number(self.factor_score_value(result, 'momentum'), 1)}",
+            f"뉴스 점수     : {number(news_score, 1)} "
             f"(환산 {number(news_score, 1)})",
             "",
             "[코멘트]",
@@ -1845,6 +2101,7 @@ class MainWindow:
 
         self.result_text.insert(tk.END, analysis_text)
         self.show_finance_result(result)
+        self.show_scenario_result(result)
         return
 
         text = "\n".join([
@@ -1925,7 +2182,7 @@ class MainWindow:
         self.finance_text.delete("1.0", tk.END)
         quant_score = self.quant_average_score(result)
         news_score = self.news_normalized_score(result)
-        quant_news_average = (quant_score + news_score) / 2
+        final_formula_score = round((quant_score * 0.7) + (news_score * 0.3), 1)
 
         def money(value):
             return self.format_display_price(
@@ -1949,9 +2206,11 @@ class MainWindow:
             f"현재가       : {money(result.price)}",
             f"가격 기준일  : {getattr(result, 'price_date', '-') or '-'}",
             f"등락률       : {number(result.change_rate)}%",
-            f"퀀트 평균    : {number(quant_score)}",
-            f"뉴스 환산점수: {number(news_score)}",
-            f"퀀트+뉴스 평균: {number(quant_news_average)}",
+            f"퀀트 점수    : {number(quant_score)}",
+            f"뉴스 점수    : {number(news_score)}",
+            f"최종 점수    : {number(final_formula_score)}",
+            "최종 산식    : 퀀트 점수 70% + 뉴스 점수 30%",
+            *self.investment_plan_lines(result, quant_score, news_score, final_formula_score),
             f"애널리스트  : {self.analyst_summary(result)}",
             f"PER          : {number(result.per)}",
             f"PBR          : {number(result.pbr)}",
@@ -2005,6 +2264,127 @@ class MainWindow:
         ])
 
         self.finance_text.insert(tk.END, finance_text)
+
+    def show_scenario_result(self, result):
+
+        if not hasattr(self, "scenario_text"):
+            return
+
+        self.scenario_text.delete("1.0", tk.END)
+        quant_score = self.quant_average_score(result)
+        news_score = self.news_normalized_score(result)
+        final_score = round((quant_score * 0.7) + (news_score * 0.3), 1)
+        currency = getattr(result, "currency", "KRW")
+        price = safe_number(getattr(result, "price", 0))
+        remote_record = getattr(result, "remote_record", None)
+
+        if isinstance(remote_record, dict):
+            program_targets = remote_record.get("program_target_prices") or {}
+            downside = remote_record.get("downside_scenario") or {}
+            scenario_summary = remote_record.get("scenario_summary") or ""
+            analyst_target = safe_number(
+                remote_record.get("analyst_target_price")
+                or remote_record.get("target_price", 0)
+            )
+            analyst_high = safe_number(remote_record.get("analyst_target_high", 0))
+            analyst_low = safe_number(remote_record.get("analyst_target_low", 0))
+        else:
+            factor_scores = SharedAnalysisBridge.factor_scores(result)
+            stock_type = SharedAnalysisBridge.stock_type(
+                result,
+                str(getattr(result, "code", "") or ""),
+                str(getattr(result, "name", "") or ""),
+            )
+            analyst_target = safe_number(
+                getattr(result, "analyst_target_mean", 0)
+                or getattr(result, "target_price", 0)
+            )
+            analyst_high = safe_number(getattr(result, "analyst_target_high", 0))
+            analyst_low = safe_number(getattr(result, "analyst_target_low", 0))
+            program_targets = SharedAnalysisBridge.program_target_prices(
+                result=result,
+                price=price,
+                final_score=final_score,
+                news_score=news_score,
+                factor_scores=factor_scores,
+                stock_type=stock_type,
+                currency=currency,
+            )
+            downside = SharedAnalysisBridge.downside_scenario(
+                result=result,
+                price=price,
+                final_score=final_score,
+                news_score=news_score,
+                factor_scores=factor_scores,
+                metrics={
+                    "change_1d": safe_number(getattr(result, "change_rate", 0)),
+                    "change_1m": 0,
+                    "change_3m": 0,
+                },
+                data_confidence="medium",
+                currency=currency,
+            )
+            scenario_summary = SharedAnalysisBridge.scenario_summary(
+                analyst_target,
+                program_targets,
+                downside,
+            )
+
+        def money(value):
+            value = safe_number(value)
+            if value <= 0:
+                return "-"
+            return self.format_display_price(value, currency, compact=True)
+
+        analyst_upside = (
+            ((analyst_target - price) / price) * 100
+            if analyst_target > 0 and price > 0
+            else 0
+        )
+        target_lines = [
+            "==============================",
+            f"시나리오 - {result.name} ({result.code})",
+            "==============================",
+            "",
+            "[요약]",
+            scenario_summary or "-",
+            "",
+            "[애널리스트 목표가]",
+            f"평균 목표가 : {money(analyst_target)}"
+            + (f" ({analyst_upside:+.1f}%)" if analyst_target > 0 and price > 0 else ""),
+            f"상단 목표가 : {money(analyst_high)}",
+            f"하단 목표가 : {money(analyst_low)}",
+            "설명        : 증권사 또는 데이터 제공처의 애널리스트 목표가입니다. 없으면 '-'로 표시합니다.",
+            "",
+            "[프로그램 산출 목표가]",
+            f"보수 목표가 : {money(program_targets.get('conservative', 0))}",
+            f"기준 목표가 : {money(program_targets.get('base', 0))}",
+            f"공격 목표가 : {money(program_targets.get('aggressive', 0))}",
+            f"산출 기준   : {program_targets.get('method', '-')}",
+            f"이유        : {program_targets.get('reason', '-')}",
+            f"설명        : {program_targets.get('basis', '-')}",
+            "",
+            "[하락 시나리오]",
+            f"하락 위험도 : {downside.get('risk_level', '-')}",
+            f"1차 지지선  : {money(downside.get('support_1', 0))}",
+            f"2차 지지선  : {money(downside.get('support_2', 0))}",
+            f"손절/점검선 : {money(downside.get('stop_check', 0))}",
+            f"산출 기준   : {downside.get('method', '-')}",
+            f"요약        : {downside.get('summary', '-')}",
+            "",
+            "[하락 시나리오 이유]",
+        ]
+        target_lines.extend(
+            f"- {reason}"
+            for reason in downside.get("reasons", []) or ["위험 이유 데이터 없음"]
+        )
+        target_lines.extend([
+            "",
+            "[주의]",
+            "프로그램 산출 목표가와 하락 시나리오는 예측값이 아니라 대응 기준가입니다.",
+        ])
+
+        self.scenario_text.insert(tk.END, "\n".join(target_lines))
 
     def save_current_report(self):
 
@@ -2162,6 +2542,9 @@ class MainWindow:
         self.scheduled_time_var.set(
             settings.get("scheduled_time", "08:30")
         )
+        self.auto_refresh_interval_var.set(
+            str(settings.get("auto_refresh_interval_minutes", "20"))
+        )
         self.alert_recipient_var.set(
             settings.get("alert_recipient", "")
         )
@@ -2181,7 +2564,7 @@ class MainWindow:
             bool(settings.get("smtp_tls", True))
         )
         self.api_base_url_var.set(
-            settings.get("api_base_url", "")
+            self.normalize_server_url(settings.get("api_base_url", ""))
         )
 
     def save_alert_settings(self):
@@ -2198,12 +2581,33 @@ class MainWindow:
                 )
                 return
 
-        api_base_url = self.api_base_url_var.get().strip().rstrip("/")
+        api_base_url = self.normalize_server_url(self.api_base_url_var.get())
+        self.api_base_url_var.set(api_base_url)
+
+        try:
+            auto_refresh_interval = int(
+                float(self.auto_refresh_interval_var.get().strip())
+            )
+        except ValueError:
+            messagebox.showerror(
+                "자동 새로고침 설정",
+                "자동 새로고침 시간은 숫자로 입력하세요."
+            )
+            return
+
+        if auto_refresh_interval < 1:
+            messagebox.showerror(
+                "자동 새로고침 설정",
+                "자동 새로고침 시간은 1분 이상이어야 합니다."
+            )
+            return
+
+        self.auto_refresh_interval_var.set(str(auto_refresh_interval))
 
         if api_base_url and not api_base_url.startswith(("http://", "https://")):
             messagebox.showerror(
                 "서버 설정",
-                "Render 서버 URL은 https:// 로 시작해야 합니다."
+                "분석 서버 URL은 https:// 로 시작해야 합니다."
             )
             return
 
@@ -2214,6 +2618,7 @@ class MainWindow:
             "alert_threshold": self.alert_threshold_var.get(),
             "scheduled_email": self.scheduled_email_var.get(),
             "scheduled_time": scheduled_time,
+            "auto_refresh_interval_minutes": auto_refresh_interval,
             "alert_recipient": self.alert_recipient_var.get().strip(),
             "smtp_host": self.smtp_host_var.get().strip(),
             "smtp_port": self.smtp_port_var.get().strip(),
@@ -2257,6 +2662,73 @@ class MainWindow:
 
         return RemoteAnalysisClient(self.api_base_url_var.get().strip())
 
+    def get_auto_refresh_interval_ms(self):
+
+        try:
+            minutes = int(float(self.auto_refresh_interval_var.get().strip()))
+        except ValueError:
+            minutes = 20
+
+        return max(minutes, 1) * 60 * 1000
+
+    def cached_price_summary(self, code):
+
+        cached = self.service._cache_get(
+            self.service.price_summary_cache,
+            code,
+            self.service.price_summary_cache_ttl
+        )
+
+        if cached is not None:
+            return cached
+
+        preset = self.get_weight_preset()
+        result = self.service.analysis_cache.get(
+            (
+                code,
+                "2025",
+                "11011",
+                preset
+            )
+        )
+
+        if result is not None:
+            return {
+                "price": safe_number(getattr(result, "price", 0)),
+                "change": safe_number(getattr(result, "change_rate", 0)),
+                "currency": getattr(result, "currency", "KRW"),
+                "price_date": getattr(result, "price_date", ""),
+            }
+
+        return {
+            "price": 0,
+            "change": 0,
+            "currency": "KRW",
+            "price_date": "",
+        }
+
+    def cached_briefing_metrics(self, code):
+
+        summary = self.cached_price_summary(code)
+
+        return {
+            "price": safe_number(summary.get("price", 0)),
+            "change_1d": safe_number(summary.get("change", 0)),
+            "change_1m": 0,
+            "change_3m": 0,
+            "currency": summary.get("currency", "KRW"),
+            "price_date": summary.get("price_date", ""),
+        }
+
+    def normalize_server_url(self, value):
+
+        value = str(value or "").strip().rstrip("/")
+
+        if not value or value == "https://stock-z1su.onrender.com":
+            return DEFAULT_ANALYSIS_SERVER_URL
+
+        return value
+
     def start_server_prewarm(self):
 
         client = self.remote_client()
@@ -2277,7 +2749,7 @@ class MainWindow:
             client.health()
             self.root.after(
                 0,
-                lambda: self.status_var.set("Render 서버 준비 완료")
+                lambda: self.status_var.set("분석 서버 준비 완료")
             )
         except Exception:
             pass
@@ -2287,7 +2759,7 @@ class MainWindow:
         self.root.after(
             0,
             lambda: self.status_var.set(
-                f"{label} 접속 중... Render 서버를 깨우는 중입니다."
+                f"{label} 접속 중... 분석 서버를 준비하는 중입니다."
             )
         )
 
@@ -2454,11 +2926,22 @@ class MainWindow:
             "currency": record.get("currency", "KRW"),
             "price_date": record.get("price_date", ""),
             "analyst_target_mean": safe_number(record.get("target_price", 0)),
+            "analyst_target_high": safe_number(record.get("analyst_target_high", 0)),
+            "analyst_target_low": safe_number(record.get("analyst_target_low", 0)),
             "analyst_recommendation": record.get("analyst", ""),
             "score_breakdown": score_breakdown,
             "factor_scores": factor_scores,
             "score_reason": record.get("score_reason", ""),
             "score_adjustments": record.get("score_adjustments", []),
+            "buy_reason": record.get("buy_reason", ""),
+            "risk_factors": record.get("risk_factors", ""),
+            "stop_loss_basis": record.get("stop_loss_basis", ""),
+            "add_buy_basis": record.get("add_buy_basis", ""),
+            "hold_reason": record.get("hold_reason", ""),
+            "next_check_date": record.get("next_check_date", ""),
+            "daily_status": record.get("daily_status", ""),
+            "daily_core": record.get("daily_core", ""),
+            "daily_judgment": record.get("daily_judgment", ""),
             "preset": preset,
             "remote_record": record,
             "remote_source": True,
@@ -2483,7 +2966,7 @@ class MainWindow:
 
         quant_score = self.quant_average_score(result)
         news_score = self.news_normalized_score(result)
-        avg_score = (quant_score + news_score) / 2
+        final_score = round((quant_score * 0.7) + (news_score * 0.3), 1)
         price = safe_number(getattr(result, "price", 0))
         target_price = safe_number(
             getattr(result, "analyst_target_mean", 0)
@@ -2495,19 +2978,22 @@ class MainWindow:
             else 0
         )
 
-        try:
-            news = self.get_core_news(result.name)
-        except Exception:
-            news = []
+        news = []
+        remote_record = getattr(result, "remote_record", None)
+
+        if isinstance(remote_record, dict):
+            news = remote_record.get("news", [])[:3]
 
         return {
             "code": result.code,
             "name": result.name,
-            "final_score": avg_score,
+            "final_score": final_score,
             "change_1d": safe_number(getattr(result, "change_rate", 0)),
             "news_score": news_score,
+            "target_price": target_price,
             "target_upside": target_upside,
             "price": price,
+            "volume_ratio": safe_number(getattr(result, "volume_ratio", 0)),
             "news": news,
         }
 
@@ -2849,26 +3335,144 @@ class MainWindow:
 
     @staticmethod
     def quant_average_score(result):
+        return SharedAnalysisBridge.quant_average_score(result)
 
-        factor_max = {
-            "value": 100,
-            "quality": 130,
-            "growth": 60,
-            "stability": 20,
-            "dividend": 10,
-            "momentum": 50,
+    @staticmethod
+    def factor_score_value(result, name):
+        factor_scores = getattr(result, "factor_scores", None)
+
+        if not factor_scores:
+            factor_scores = SharedAnalysisBridge.factor_scores(result)
+
+        return safe_number(factor_scores.get(name, 0))
+
+    def investment_plan_lines(
+        self,
+        result,
+        quant_score=None,
+        news_score=None,
+        final_score=None,
+    ):
+        quant_score = (
+            self.quant_average_score(result)
+            if quant_score is None
+            else safe_number(quant_score)
+        )
+        news_score = (
+            self.news_normalized_score(result)
+            if news_score is None
+            else safe_number(news_score)
+        )
+        final_score = (
+            round((quant_score * 0.7) + (news_score * 0.3), 1)
+            if final_score is None
+            else safe_number(final_score)
+        )
+        target = safe_number(
+            getattr(result, "analyst_target_mean", 0)
+            or getattr(result, "target_price", 0)
+        )
+        price = safe_number(getattr(result, "price", 0))
+        target_upside = (
+            ((target - price) / price) * 100
+            if target > 0 and price > 0
+            else safe_number(getattr(result, "target_upside", 0))
+        )
+        target_text = (
+            f"{self.format_display_price(target, getattr(result, 'currency', 'KRW'), compact=True)}"
+            f" ({target_upside:+.1f}%)"
+            if target > 0
+            else "목표가 데이터 없음"
+        )
+
+        action_plan = {
+            "buy_reason": getattr(result, "buy_reason", ""),
+            "risk_factors": getattr(result, "risk_factors", ""),
+            "stop_loss_basis": getattr(result, "stop_loss_basis", ""),
+            "add_buy_basis": getattr(result, "add_buy_basis", ""),
+            "hold_reason": getattr(result, "hold_reason", ""),
+            "next_check_date": getattr(result, "next_check_date", ""),
         }
-        scores = [
-            (
-                max(
-                    min(safe_number(getattr(result, name, 0)), max_score),
-                    0
-                ) / max_score
-            ) * 100
-            for name, max_score in factor_max.items()
+
+        if not all(action_plan.values()):
+            holding = self.holdings.get(str(getattr(result, "code", "")).upper(), {})
+            action_plan.update(
+                SharedAnalysisBridge.action_plan(
+                    result=result,
+                    price=price,
+                    target_price=target,
+                    target_upside=target_upside,
+                    quant_score=quant_score,
+                    news_score=news_score,
+                    final_score=final_score,
+                    factor_scores=SharedAnalysisBridge.factor_scores(result),
+                    holding=holding,
+                )
+            )
+
+        return [
+            f"매수 이유     : {action_plan['buy_reason']}",
+            f"위험 요소     : {action_plan['risk_factors']}",
+            f"목표가        : {target_text}",
+            f"손절 기준     : {action_plan['stop_loss_basis']}",
+            f"추가 매수 기준: {action_plan['add_buy_basis']}",
+            f"보유 이유     : {action_plan['hold_reason']}",
+            f"다음 확인 날짜: {action_plan['next_check_date']}",
         ]
 
-        return sum(scores) / len(scores)
+    def daily_status(self, result, final_score):
+        value = getattr(result, "daily_status", "")
+
+        if value:
+            return value
+
+        if final_score >= 85:
+            return "강한 관심"
+        if final_score >= 72:
+            return "관심"
+        if final_score >= 55:
+            return "관망"
+        if final_score >= 40:
+            return "주의"
+        return "위험"
+
+    def daily_core(self, result):
+        value = getattr(result, "daily_core", "")
+
+        if value:
+            return value
+
+        news = []
+        remote_record = getattr(result, "remote_record", None)
+
+        if isinstance(remote_record, dict):
+            news = remote_record.get("news", [])[:3]
+
+        snapshot = SharedAnalysisBridge.daily_snapshot(
+            result=result,
+            metrics={
+                "change_1d": safe_number(getattr(result, "change_rate", 0)),
+                "change_1m": 0,
+            },
+            news_items=news,
+            final_score=safe_number(getattr(result, "score", 0)),
+            news_score=self.news_normalized_score(result),
+        )
+        return snapshot["daily_core"]
+
+    def daily_judgment(self, result, final_score):
+        value = getattr(result, "daily_judgment", "")
+
+        if value:
+            return value
+
+        return SharedAnalysisBridge.daily_snapshot(
+            result=result,
+            metrics={},
+            news_items=[],
+            final_score=final_score,
+            news_score=self.news_normalized_score(result),
+        )["daily_judgment"]
 
     @staticmethod
     def news_normalized_score(result):
@@ -3200,8 +3804,11 @@ class MainWindow:
             fontsize=9,
             fontweight="bold"
         )
-        if show_ma:
+        handles, labels = self.ax.get_legend_handles_labels()
+        if show_ma and handles and labels:
             self.ax.legend(
+                handles,
+                labels,
                 loc="upper left",
                 bbox_to_anchor=(0.0, 0.90),
                 frameon=False,
@@ -3235,12 +3842,19 @@ class MainWindow:
 
     def get_chart_history(self, stock_code, period, interval):
 
-        source_interval = "1d"
+        source_interval = interval
         history = self.service.price.get_history(
             stock_code,
             period=period,
             interval=source_interval
         )
+
+        if history is None and source_interval != "1d":
+            history = self.service.price.get_history(
+                stock_code,
+                period=period,
+                interval="1d"
+            )
 
         if history is None:
             return None
@@ -3455,6 +4069,8 @@ class MainWindow:
         self.refresh_stock_list()
         self.refresh_portfolio_table(auto_analyze=False)
         self.refresh_dashboard()
+        self.refresh_event_tab()
+        self.refresh_strategy_tab()
 
     def on_stock_select(self, event):
 
@@ -3521,20 +4137,10 @@ class MainWindow:
             )
             score = result.score if result else 0
 
-            try:
-                summary = self.service.get_price_summary(
-                    stock["code"]
-                )
-
-                price = safe_number(summary.get("price"))
-                change = safe_number(summary.get("change"))
-                currency = summary.get("currency", "KRW")
-
-            except Exception:
-
-                price = 0
-                change = 0
-                currency = "KRW"
+            summary = self.cached_price_summary(stock["code"])
+            price = safe_number(summary.get("price"))
+            change = safe_number(summary.get("change"))
+            currency = summary.get("currency", "KRW")
 
             if change > 0:
                 arrow = "▲"
@@ -3609,15 +4215,10 @@ class MainWindow:
             if result is None:
                 missing_stocks.append(stock)
 
-            try:
-                summary = self.service.get_price_summary(code)
-                price = safe_number(summary.get("price"))
-                change = safe_number(summary.get("change"))
-                currency = summary.get("currency", "KRW")
-            except Exception:
-                price = 0
-                change = 0
-                currency = "KRW"
+            summary = self.cached_price_summary(code)
+            price = safe_number(summary.get("price"))
+            change = safe_number(summary.get("change"))
+            currency = summary.get("currency", "KRW")
 
             score = safe_number(
                 getattr(result, "score", 0)
@@ -3852,15 +4453,10 @@ class MainWindow:
                 )
             )
 
-            try:
-                summary = self.service.get_price_summary(code)
-                price = safe_number(summary.get("price"))
-                change = safe_number(summary.get("change"))
-                currency = summary.get("currency", "KRW")
-            except Exception:
-                price = 0
-                change = 0
-                currency = "KRW"
+            summary = self.cached_price_summary(code)
+            price = safe_number(summary.get("price"))
+            change = safe_number(summary.get("change"))
+            currency = summary.get("currency", "KRW")
 
             holding = self.holdings.get(code, {})
             quantity = safe_number(holding.get("quantity", 0))
@@ -3889,6 +4485,8 @@ class MainWindow:
                 self._holding_feedback(
                     result,
                     quantity,
+                    avg_price,
+                    price,
                     pnl,
                     0,
                     0
@@ -3952,6 +4550,398 @@ class MainWindow:
             )
         )
 
+    def update_pc_right_summary(self, card_values, group_name, stock_count, best_result):
+
+        if not hasattr(self, "pc_summary_vars"):
+            return
+
+        mapping = {
+            "value": card_values.get("total_value", "-"),
+            "pnl": card_values.get("total_pnl", "-"),
+            "risk": card_values.get("risk", "-"),
+            "attention": card_values.get("attention", "-"),
+            "upside": card_values.get("upside", "-"),
+            "danger": card_values.get("danger", "-"),
+            "events": card_values.get("events", "-"),
+        }
+
+        for key, value in mapping.items():
+            var = self.pc_summary_vars.get(key)
+
+            if var:
+                var.set(value)
+
+        lines = [
+            f"그룹: {group_name}",
+            f"관심종목: {stock_count}개",
+            (
+                f"최고 점수: {best_result.name} {safe_number(best_result.score):.1f}"
+                if best_result
+                else "최고 점수: 분석 대기"
+            ),
+            "",
+            "위험 증가 종목과 중요 이벤트는 상세 탭에서 확인하세요.",
+        ]
+        self.write_text_widget(self.pc_summary_message, "\n".join(lines))
+
+    def refresh_detail_tab(self):
+
+        if not hasattr(self, "detail_summary_text"):
+            return
+
+        code = self.current_stock
+
+        if not code:
+            self.detail_summary_var.set("종목을 선택하면 상세 요약이 표시됩니다.")
+            self.write_text_widget(self.detail_summary_text, "선택된 종목이 없습니다.")
+            return
+
+        preset = self.get_weight_preset()
+        result = self.service.analysis_cache.get((code, "2025", "11011", preset))
+        stock = self.find_stock_by_code(code)
+        name = (
+            getattr(result, "name", "")
+            or (stock or {}).get("name")
+            or code
+        )
+        summary = self.cached_price_summary(code)
+        price = safe_number(summary.get("price"))
+        currency = summary.get("currency", "KRW")
+        holding = self.holdings.get(code, {})
+        quantity = safe_number(holding.get("quantity", 0))
+        avg_price = safe_number(holding.get("avg_price", 0))
+        pnl = (
+            ((price - avg_price) / avg_price) * 100
+            if quantity > 0 and avg_price > 0
+            else 0
+        )
+        remote_record = (
+            getattr(result, "remote_record", None)
+            if result
+            else {}
+        )
+        final_score = safe_number(
+            remote_record.get("final_score")
+            if isinstance(remote_record, dict)
+            else getattr(result, "score", 0)
+        )
+        rating = (
+            remote_record.get("rating")
+            or remote_record.get("grade")
+            if isinstance(remote_record, dict)
+            else self.final_grade(result, final_score)
+        )
+        action_summary = (
+            remote_record.get("action_summary")
+            if isinstance(remote_record, dict)
+            else ""
+        ) or "분석 후 행동 요약이 표시됩니다."
+        score_diff = (
+            remote_record.get("final_score_diff")
+            if isinstance(remote_record, dict)
+            else None
+        )
+        score_diff_text = (
+            "전회 비교 없음"
+            if score_diff is None
+            else f"전회 대비 {safe_number(score_diff):+.1f}점"
+        )
+
+        self.detail_summary_var.set(
+            f"{name} | 현재가 {self.format_display_price(price, currency, compact=True)} | "
+            f"등급 {rating} | 점수 {final_score:.1f} | {score_diff_text} | "
+            f"평단 대비 {pnl:+.1f}% | {action_summary}"
+        )
+        self.write_text_widget(
+            self.detail_summary_text,
+            "\n".join([
+                f"종목명: {name} ({code})",
+                f"현재가: {self.format_display_price(price, currency)}",
+                f"현재 판단: {rating}",
+                f"최종 점수: {final_score:.1f}",
+                f"점수 변경: {score_diff_text}",
+                f"평단 대비 수익률: {pnl:+.1f}%" if quantity > 0 else "평단 대비 수익률: 보유 입력 없음",
+                f"핵심 이유: {self.record_text(remote_record, 'score_change_reason')}",
+                f"행동 요약: {action_summary}",
+            ])
+        )
+        self.write_text_widget(
+            self.detail_score_text,
+            self.build_detail_score_text(result, remote_record)
+        )
+        self.populate_detail_news(remote_record)
+        self.write_text_widget(
+            self.detail_strategy_text,
+            self.build_detail_strategy_text(result, remote_record)
+        )
+        self.write_text_widget(
+            self.detail_event_text,
+            self.build_detail_event_text(remote_record)
+        )
+        self.write_text_widget(
+            self.detail_history_text,
+            self.build_detail_history_text(remote_record)
+        )
+
+    def write_text_widget(self, widget, text):
+
+        if widget is None:
+            return
+
+        widget.configure(state="normal")
+        widget.delete("1.0", tk.END)
+        widget.insert(tk.END, text or "-")
+        widget.configure(state="disabled")
+
+    @staticmethod
+    def record_text(record, key, default="-"):
+
+        if isinstance(record, dict):
+            value = record.get(key)
+            return str(value) if value not in (None, "") else default
+
+        return default
+
+    def build_detail_score_text(self, result, record):
+
+        factor_scores = record.get("factor_scores", {}) if isinstance(record, dict) else {}
+        risk_reasons = record.get("risk_reasons", []) if isinstance(record, dict) else []
+        confidence_reasons = (
+            record.get("data_confidence_reasons", [])
+            if isinstance(record, dict)
+            else []
+        )
+        quant_score = safe_number(
+            record.get("quant_score")
+            if isinstance(record, dict)
+            else SharedAnalysisBridge.quant_average_score(result)
+        )
+        news_score = safe_number(
+            record.get("news_score")
+            if isinstance(record, dict)
+            else self.news_normalized_score(result)
+        )
+        final_score = safe_number(
+            record.get("final_score")
+            if isinstance(record, dict)
+            else ((quant_score * 0.7) + (news_score * 0.3))
+        )
+        lines = [
+            f"최종 점수: {final_score:.1f}",
+            f"퀀트 점수: {quant_score:.1f}",
+            f"뉴스 점수: {news_score:.1f}",
+            f"데이터 신뢰도: {self.record_text(record, 'data_confidence')}",
+            f"종목 유형별 모델: {self.record_text(record, 'stock_type')}",
+            "",
+            "팩터 점수",
+        ]
+        labels = {
+            "value": "가치",
+            "quality": "품질",
+            "growth": "성장",
+            "stability": "안정성",
+            "momentum": "모멘텀",
+            "dividend": "배당",
+        }
+
+        for key, label in labels.items():
+            lines.append(f"- {label}: {safe_number(factor_scores.get(key, 0)):.1f}")
+
+        lines.extend([
+            "",
+            "감점 사유",
+            *(f"- {item}" for item in (risk_reasons or ["감점 사유 없음"])),
+            "",
+            "데이터 신뢰도 이유",
+            *(f"- {item}" for item in (confidence_reasons or ["데이터 신뢰도 정보 없음"])),
+            "",
+            "WATCH BUY: 65점 이상 72점 미만으로, 신규 매수보다 조정 시 관심 구간입니다.",
+        ])
+        return "\n".join(lines)
+
+    def populate_detail_news(self, record):
+
+        if not hasattr(self, "detail_news_tree"):
+            return
+
+        for item in self.detail_news_tree.get_children():
+            self.detail_news_tree.delete(item)
+
+        news_items = record.get("news", []) if isinstance(record, dict) else []
+
+        for item in news_items[:20]:
+            self.detail_news_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    item.get("date", "-"),
+                    item.get("impact_label", "중립"),
+                    item.get("title", "-"),
+                )
+            )
+
+    def build_detail_strategy_text(self, result, record):
+
+        strategy = record.get("user_strategy", {}) if isinstance(record, dict) else {}
+        lines = [
+            f"매수 이유: {self.record_text(record, 'buy_reason')}",
+            f"보유 이유: {self.record_text(record, 'hold_reason')}",
+            f"목표가: {self.target_text(record) if isinstance(record, dict) else '-'}",
+            f"손절 기준: {self.record_text(record, 'stop_loss_basis')}",
+            f"추가매수 기준: {self.record_text(record, 'add_buy_basis')}",
+            f"사용자 전략: {strategy.get('strategy') or strategy.get('name') or '-'}",
+            f"전략 판단: {self.record_text(record, 'user_adjusted_action')}",
+            f"메모: {strategy.get('memo') or self.record_text(record, 'user_strategy_reason')}",
+        ]
+        return "\n".join(lines)
+
+    def build_detail_event_text(self, record):
+
+        events = record.get("events", []) if isinstance(record, dict) else []
+        lines = [
+            f"중요 이벤트 경고: {self.record_text(record, 'event_warning')}",
+            "",
+            "이벤트 목록",
+        ]
+
+        if not events:
+            lines.append("- 등록된 이벤트 없음")
+
+        for item in events:
+            lines.append(
+                f"- {item.get('event_date', '-')} | {item.get('event_type', '-')} | "
+                f"{item.get('event_title', '-')} | {item.get('importance', 'medium')}"
+            )
+
+            if item.get("memo"):
+                lines.append(f"  메모: {item.get('memo')}")
+
+        return "\n".join(lines)
+
+    def build_detail_history_text(self, record):
+
+        change = record.get("score_change", {}) if isinstance(record, dict) else {}
+        history = (
+            record.get("analysis_history", [])
+            if isinstance(record, dict)
+            else []
+        )
+        lines = [
+            f"이전 점수: {change.get('previous_final_score', '-')}",
+            f"현재 점수: {change.get('current_final_score', '-')}",
+            f"등급 변경: {'예' if change.get('rating_changed') else '아니오'}",
+            f"변경 이유: {change.get('score_change_reason', '-')}",
+            "",
+            "과거 판단 검증",
+        ]
+
+        if not history:
+            lines.append("- 기록 없음")
+
+        for item in history[:10]:
+            lines.append(
+                f"- {item.get('analyzed_at', '-')} | "
+                f"{item.get('final_score', '-')}점 | {item.get('rating', '-')} | "
+                f"7일 {item.get('return_after_7d', None)} | "
+                f"30일 {item.get('return_after_30d', None)}"
+            )
+
+        return "\n".join(lines)
+
+    def refresh_event_tab(self):
+
+        if not hasattr(self, "event_text"):
+            return
+
+        stocks = (
+            self.groups.get(self.current_group, [])
+            if self.current_group
+            else []
+        )
+        preset = self.get_weight_preset()
+        lines = ["이벤트 캘린더", ""]
+        event_count = 0
+
+        for stock in stocks:
+            code = stock.get("code")
+            result = self.service.analysis_cache.get((code, "2025", "11011", preset))
+            record = getattr(result, "remote_record", {}) if result else {}
+            events = record.get("events", []) if isinstance(record, dict) else []
+            warning = record.get("event_warning", "") if isinstance(record, dict) else ""
+
+            if warning:
+                lines.append(f"[{stock.get('name', code)}] {warning}")
+
+            for item in events:
+                event_count += 1
+                lines.append(
+                    f"- {stock.get('name', code)} | {item.get('event_date', '-')} | "
+                    f"{item.get('event_type', '-')} | {item.get('event_title', '-')}"
+                )
+
+        if event_count == 0:
+            lines.append("등록된 이벤트가 없습니다. 서버 /api/events 또는 사용자 입력으로 이벤트를 추가할 수 있습니다.")
+
+        self.write_text_widget(self.event_text, "\n".join(lines))
+
+    def refresh_strategy_tab(self):
+
+        if not hasattr(self, "strategy_text"):
+            return
+
+        stocks = (
+            self.groups.get(self.current_group, [])
+            if self.current_group
+            else []
+        )
+        preset = self.get_weight_preset()
+        lines = ["전략 / 메모", ""]
+
+        for stock in stocks:
+            code = stock.get("code")
+            result = self.service.analysis_cache.get((code, "2025", "11011", preset))
+            record = getattr(result, "remote_record", {}) if result else {}
+            strategy = record.get("user_strategy", {}) if isinstance(record, dict) else {}
+            lines.extend([
+                f"[{stock.get('name', code)} / {code}]",
+                f"- 사용자 전략: {strategy.get('strategy') or strategy.get('name') or '-'}",
+                f"- 전략 판단: {self.record_text(record, 'user_adjusted_action')}",
+                f"- 행동 요약: {self.record_text(record, 'action_summary')}",
+                f"- 메모: {strategy.get('memo') or self.record_text(record, 'user_strategy_reason')}",
+                "",
+            ])
+
+        if not stocks:
+            lines.append("관심종목 그룹을 선택하세요.")
+
+        self.write_text_widget(self.strategy_text, "\n".join(lines))
+
+    def find_stock_by_code(self, code):
+
+        for stocks in self.groups.values():
+            for stock in stocks:
+                if str(stock.get("code", "")).upper() == str(code or "").upper():
+                    return stock
+
+        return None
+
+    def target_text(self, record):
+
+        if not isinstance(record, dict):
+            return ""
+
+        target = safe_number(record.get("target_price", 0))
+        upside = safe_number(record.get("target_upside", 0))
+        currency = record.get("currency", "KRW")
+
+        if target <= 0:
+            return ""
+
+        return (
+            f"{self.format_display_price(target, currency, compact=True)}"
+            f" ({upside:+.1f}%)"
+        )
+
     def refresh_briefing_table(self):
 
         if not hasattr(self, "briefing_tree"):
@@ -3982,17 +4972,7 @@ class MainWindow:
             if result is None:
                 missing_stocks.append(stock)
 
-            try:
-                metrics = self.service.get_briefing_metrics(code)
-            except Exception:
-                metrics = {
-                    "price": 0,
-                    "change_1d": 0,
-                    "change_1m": 0,
-                    "change_3m": 0,
-                    "currency": "KRW",
-                    "price_date": "",
-                }
+            metrics = self.cached_briefing_metrics(code)
 
             quant_score = (
                 self.quant_average_score(result)
@@ -4080,7 +5060,8 @@ class MainWindow:
                 self.build_ai_quant_briefing(
                     self.current_group,
                     preset,
-                    analyze_missing=False
+                    analyze_missing=False,
+                    use_cached=True
                 )
             )
 
@@ -4130,14 +5111,16 @@ class MainWindow:
         self,
         group_name,
         preset,
-        analyze_missing=True
+        analyze_missing=True,
+        use_cached=False
     ):
 
         now = datetime.now()
         records = self.build_briefing_records(
             group_name,
             preset,
-            analyze_missing=analyze_missing
+            analyze_missing=analyze_missing,
+            use_cached=use_cached
         )
         domestic = [
             item for item in records
@@ -4198,7 +5181,8 @@ class MainWindow:
         self,
         group_name,
         preset,
-        analyze_missing=True
+        analyze_missing=True,
+        use_cached=False
     ):
 
         records = []
@@ -4247,23 +5231,34 @@ class MainWindow:
                 except Exception:
                     result = None
 
-            try:
-                metrics = self.service.get_briefing_metrics(code)
-            except Exception:
-                metrics = {
-                    "price": safe_number(getattr(result, "price", 0)),
-                    "currency": getattr(result, "currency", "KRW"),
-                    "price_date": getattr(result, "price_date", ""),
-                    "change_1d": safe_number(
-                        getattr(result, "change_rate", 0)
-                    ),
-                    "change_1m": 0,
-                    "change_3m": 0,
-                }
+            if use_cached:
+                metrics = self.cached_briefing_metrics(code)
+            else:
+                try:
+                    metrics = self.service.get_briefing_metrics(code)
+                except Exception:
+                    metrics = {
+                        "price": safe_number(getattr(result, "price", 0)),
+                        "currency": getattr(result, "currency", "KRW"),
+                        "price_date": getattr(result, "price_date", ""),
+                        "change_1d": safe_number(
+                            getattr(result, "change_rate", 0)
+                        ),
+                        "change_1m": 0,
+                        "change_3m": 0,
+                    }
 
-            news = self.get_core_news(
-                getattr(result, "name", stock.get("name", code))
-            )
+            news = []
+
+            if not use_cached:
+                news = self.get_core_news(
+                    getattr(result, "name", stock.get("name", code))
+                )
+            elif result is not None:
+                remote_record = getattr(result, "remote_record", None)
+
+                if isinstance(remote_record, dict):
+                    news = remote_record.get("news", [])[:3]
             avg_score = (
                 (
                     self.quant_average_score(result)
@@ -4370,7 +5365,7 @@ class MainWindow:
         order = [
             "STRONG BUY",
             "BUY",
-            "SPEC BUY",
+            "WATCH BUY",
             "HOLD",
             "REDUCE",
             "SELL",
@@ -4391,17 +5386,14 @@ class MainWindow:
         if result is None:
             return "분석 대기"
 
-        speculative = (
-            safe_number(getattr(result, "net_income", 0)) <= 0
-            or safe_number(getattr(result, "price", 0)) < 10
-            or getattr(result, "asset_type", "STOCK") == "ETF"
-        )
-
         if avg_score >= 85:
             return "STRONG BUY"
 
         if avg_score >= 72:
-            return "SPEC BUY" if speculative else "BUY"
+            return "BUY"
+
+        if avg_score >= 65:
+            return "WATCH BUY"
 
         if avg_score >= 55:
             return "HOLD"
@@ -4682,10 +5674,11 @@ class MainWindow:
         invested = sum(row["amount"] for row in rows)
         capital = self.get_portfolio_capital()
         cash = max(capital - invested, 0)
+        summary = self.portfolio_exposure_summary(rows)
         self.portfolio_summary_var.set(
             f"{self.current_group} | {preset} | "
             f"편입 {len(rows)}종목 | 투자금 {capital:,.0f}원 | "
-            f"예상 현금 {cash:,.0f}원"
+            f"예상 현금 {cash:,.0f}원\n{summary}"
         )
 
     def build_portfolio_rows(self, results):
@@ -4743,6 +5736,7 @@ class MainWindow:
             holding_qty = safe_number(holding.get("quantity", 0))
             avg_price = safe_number(holding.get("avg_price", 0))
             market_value = holding_qty * price
+            cost = holding_qty * avg_price
             pnl = (
                 ((price - avg_price) / avg_price) * 100
                 if avg_price > 0 and holding_qty > 0
@@ -4758,6 +5752,8 @@ class MainWindow:
             feedback = self._holding_feedback(
                 result,
                 holding_qty,
+                avg_price,
+                price,
                 pnl,
                 weight,
                 actual_weight
@@ -4766,6 +5762,16 @@ class MainWindow:
             rows.append({
                 "code": result.code,
                 "amount": actual_amount,
+                "name": result.name,
+                "score": score,
+                "signal": result.signal,
+                "market_value": market_value,
+                "cost": cost,
+                "pnl_rate": pnl if holding_qty > 0 else 0,
+                "actual_weight": actual_weight,
+                "news_score": self.news_normalized_score(result),
+                "market": "국내" if str(result.code).isdigit() else "해외",
+                "theme": self.stock_theme(result),
                 "values": (
                     result.name,
                     result.code,
@@ -4794,6 +5800,78 @@ class MainWindow:
             })
 
         return rows
+
+    def portfolio_exposure_summary(self, rows):
+        held_rows = [row for row in rows if safe_number(row.get("market_value", 0)) > 0]
+
+        if not held_rows:
+            return "보유 입력 없음 | 총 평가금액 0원 | 총 손익 0원"
+
+        total_value = sum(safe_number(row.get("market_value", 0)) for row in held_rows)
+        total_cost = sum(safe_number(row.get("cost", 0)) for row in held_rows)
+        total_pnl = total_value - total_cost
+        total_pnl_rate = (total_pnl / total_cost * 100) if total_cost > 0 else 0
+        risk_value = sum(
+            safe_number(row.get("market_value", 0))
+            for row in held_rows
+            if (
+                safe_number(row.get("score", 0)) < 55
+                or safe_number(row.get("news_score", 0)) <= 35
+                or safe_number(row.get("pnl_rate", 0)) <= -10
+            )
+        )
+        market_weights = self.weight_summary(held_rows, "market", total_value)
+        theme_weights = self.weight_summary(held_rows, "theme", total_value)
+        over_weight = [
+            f"{row.get('name')} {safe_number(row.get('market_value', 0)) / total_value * 100:.1f}%"
+            for row in held_rows
+            if total_value > 0
+            and safe_number(row.get("market_value", 0)) / total_value >= 0.35
+        ]
+
+        lines = [
+            f"총 평가금액 {total_value:,.0f}원 | 총 손익 {total_pnl:+,.0f}원 ({total_pnl_rate:+.1f}%)",
+            f"위험 종목 비중 {risk_value / total_value * 100:.1f}% | 국내/해외 {market_weights}",
+            f"테마 비중 {theme_weights}",
+            "한 종목 과다 비중 경고 " + (", ".join(over_weight) if over_weight else "없음"),
+        ]
+        return "\n".join(lines)
+
+    @staticmethod
+    def weight_summary(rows, key, total_value):
+        if total_value <= 0:
+            return "-"
+
+        buckets = {}
+
+        for row in rows:
+            label = row.get(key) or "기타"
+            buckets[label] = buckets.get(label, 0) + safe_number(row.get("market_value", 0))
+
+        return " / ".join(
+            f"{label} {value / total_value * 100:.1f}%"
+            for label, value in sorted(buckets.items(), key=lambda item: item[1], reverse=True)
+            if value > 0
+        )
+
+    @staticmethod
+    def stock_theme(result):
+        text = " ".join([
+            str(getattr(result, "name", "")),
+            str(getattr(result, "code", "")),
+            str(getattr(result, "industry", "")),
+        ]).lower()
+
+        if any(word in text for word in ["bio", "바이오", "pharma", "therapeutics", "제약"]):
+            return "바이오"
+        if any(word in text for word in ["ai", "인공지능", "엔비디아", "nvidia", "msft", "meta", "googl", "oracle", "palantir"]):
+            return "AI"
+        if any(word in text for word in ["반도체", "semiconductor", "hbm", "sk하이닉스", "삼성전자", "tsm", "broadcom", "avgo"]):
+            return "반도체"
+        if any(word in text for word in ["방산", "defense", "aerospace", "한화에어로", "lig", "k방산"]):
+            return "방산"
+
+        return "기타"
 
     def get_portfolio_capital(self):
 
@@ -4832,6 +5910,8 @@ class MainWindow:
         self,
         result,
         quantity,
+        avg_price,
+        current_price,
         pnl,
         target_weight,
         actual_weight
@@ -4845,8 +5925,29 @@ class MainWindow:
                 return "신규 편입 후보"
             return "관심 유지"
 
+        if -20 < pnl <= -10 and score >= 45:
+            recovery = self.recovery_price_text(current_price, result.currency)
+            stop = self.stop_loss_basis_text(avg_price, result.currency)
+            target = self.target_price_text(result)
+            return (
+                f"목표가 {target} / 손절 기준 {stop} / "
+                "추가매수 기준 실적 발표 전후 변동성 확인 후 / "
+                f"판단 손절보다는 보유 관찰, {recovery} 회복 시 비중 축소 검토"
+            )
+
+        if pnl <= -20:
+            return (
+                f"목표가 {self.target_price_text(result)} / "
+                f"손절 기준 {self.stop_loss_basis_text(avg_price, result.currency)} / "
+                "추가매수 기준 보류 / 판단 손실 원인 재점검 및 비중 축소 검토"
+            )
+
         if score < 45 or "매도" in result.signal:
-            return "보유 축소 검토"
+            return (
+                f"목표가 {self.target_price_text(result)} / "
+                f"손절 기준 {self.stop_loss_basis_text(avg_price, result.currency)} / "
+                "추가매수 기준 보류 / 판단 보유 축소 검토"
+            )
 
         if "비중 축소" in result.signal:
             return "일부 축소 검토"
@@ -4864,6 +5965,49 @@ class MainWindow:
             return "보유 유지 우호"
 
         return "보유 유지"
+
+    def target_price_text(self, result):
+        target = safe_number(
+            getattr(result, "analyst_target_mean", 0)
+            or getattr(result, "target_price", 0)
+        )
+
+        if target <= 0:
+            return "데이터 없음"
+
+        return self.format_display_price(
+            target,
+            getattr(result, "currency", "KRW"),
+            compact=True,
+        )
+
+    def stop_loss_basis_text(self, avg_price, currency="KRW"):
+        avg_price = safe_number(avg_price)
+
+        if avg_price <= 0:
+            return "평단 입력 후 -10%"
+
+        stop_price = avg_price * 0.9
+
+        if currency == "USD":
+            return f"${stop_price:,.2f} 이탈"
+
+        rounded = round(stop_price / 1000) * 1000
+        return f"{rounded:,.0f}원 이탈"
+
+    def recovery_price_text(self, current_price, currency="KRW"):
+        current_price = safe_number(current_price)
+
+        if current_price <= 0:
+            return "단기 저항선"
+
+        target = current_price * 1.06
+
+        if currency == "USD":
+            return f"${target:,.2f}"
+
+        rounded = round(target / 1000) * 1000
+        return f"{rounded:,.0f}원"
 
     def on_portfolio_select(self, event=None):
 
@@ -5091,6 +6235,7 @@ class MainWindow:
             "alert_threshold": self.alert_threshold_var.get(),
             "scheduled_email": self.scheduled_email_var.get(),
             "scheduled_time": self.scheduled_time_var.get().strip(),
+            "auto_refresh_interval_minutes": self.auto_refresh_interval_var.get().strip(),
             "alert_recipient": self.alert_recipient_var.get().strip(),
             "smtp_host": self.smtp_host_var.get().strip(),
             "smtp_port": self.smtp_port_var.get().strip(),
@@ -5553,8 +6698,7 @@ class MainWindow:
         except Exception as e:
             print("자동 새로고침 오류 :", e)
 
-        # 10초 후 다시 실행
-        self.root.after(60000, self.auto_refresh)
+        self.root.after(self.get_auto_refresh_interval_ms(), self.auto_refresh)
 
     def load_news(self):
 

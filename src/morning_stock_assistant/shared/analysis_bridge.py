@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,58 @@ QUANT_WEIGHTS = {
     "dividend": 0.05,
 }
 
+STOCK_TYPE_WEIGHTS = {
+    "default": QUANT_WEIGHTS,
+    "large_cap": {
+        "value": 0.18,
+        "quality": 0.27,
+        "growth": 0.18,
+        "stability": 0.20,
+        "momentum": 0.12,
+        "dividend": 0.05,
+    },
+    "growth": {
+        "value": 0.10,
+        "quality": 0.22,
+        "growth": 0.28,
+        "stability": 0.10,
+        "momentum": 0.25,
+        "dividend": 0.05,
+    },
+    "biotech": {
+        "value": 0.08,
+        "quality": 0.20,
+        "growth": 0.27,
+        "stability": 0.10,
+        "momentum": 0.30,
+        "dividend": 0.05,
+    },
+    "small_cap": {
+        "value": 0.15,
+        "quality": 0.20,
+        "growth": 0.20,
+        "stability": 0.20,
+        "momentum": 0.20,
+        "dividend": 0.05,
+    },
+    "etf": {
+        "value": 0.08,
+        "quality": 0.12,
+        "growth": 0.20,
+        "stability": 0.20,
+        "momentum": 0.35,
+        "dividend": 0.05,
+    },
+    "financial": {
+        "value": 0.25,
+        "quality": 0.25,
+        "growth": 0.12,
+        "stability": 0.23,
+        "momentum": 0.10,
+        "dividend": 0.05,
+    },
+}
+
 
 @dataclass
 class BridgeStockRecord:
@@ -54,6 +107,8 @@ class BridgeStockRecord:
     news_score: float
     final_score: float
     grade: str
+    rating: str
+    machine_rating: str
     signal: str
     analyst: str
     target_price: float
@@ -61,9 +116,47 @@ class BridgeStockRecord:
     comment: str
     news: list[dict[str, Any]]
     finance: dict[str, Any]
+    analyst_target_price: float = 0.0
+    analyst_target_high: float = 0.0
+    analyst_target_low: float = 0.0
+    program_target_prices: dict[str, Any] = field(default_factory=dict)
+    downside_scenario: dict[str, Any] = field(default_factory=dict)
+    scenario_summary: str = ""
     factor_scores: dict[str, float] = field(default_factory=dict)
     score_reason: str = ""
     score_adjustments: list[dict[str, Any]] = field(default_factory=list)
+    stock_type: str = "default"
+    stock_type_weights: dict[str, float] = field(default_factory=dict)
+    data_confidence: str = "medium"
+    data_confidence_reasons: list[str] = field(default_factory=list)
+    risk_reasons: list[str] = field(default_factory=list)
+    risk_adjustment_penalty_total: float = 0.0
+    profit_rate: float = 0.0
+    action_summary: str = ""
+    score_change: dict[str, Any] = field(default_factory=dict)
+    previous_final_score: float | None = None
+    current_final_score: float | None = None
+    final_score_diff: float | None = None
+    previous_rating: str | None = None
+    current_rating: str | None = None
+    rating_changed: bool = False
+    score_change_reason: str = ""
+    events: list[dict[str, Any]] = field(default_factory=list)
+    event_warning: str = ""
+    user_strategy: dict[str, Any] = field(default_factory=dict)
+    user_adjusted_action: str = ""
+    user_strategy_reason: str = ""
+    prediction_history: list[dict[str, Any]] = field(default_factory=list)
+    analysis_history: list[dict[str, Any]] = field(default_factory=list)
+    buy_reason: str = ""
+    risk_factors: str = ""
+    stop_loss_basis: str = ""
+    add_buy_basis: str = ""
+    hold_reason: str = ""
+    next_check_date: str = ""
+    daily_status: str = ""
+    daily_core: str = ""
+    daily_judgment: str = ""
     holding_quantity: float = 0.0
     holding_avg_price: float = 0.0
 
@@ -91,12 +184,20 @@ class SharedAnalysisBridge:
         self,
         stocks: list[dict[str, Any]],
         holdings: dict[str, dict[str, Any]] | None = None,
+        previous_records: dict[str, dict[str, Any]] | None = None,
+        events: list[dict[str, Any]] | None = None,
+        user_strategies: dict[str, dict[str, Any]] | None = None,
+        analysis_history: dict[str, list[dict[str, Any]]] | None = None,
         preset: str = "균형형",
         analyze: bool = True,
         progress_callback=None,
         max_workers: int = 4,
     ) -> list[dict[str, Any]]:
         holdings = holdings or {}
+        previous_records = previous_records or {}
+        events = events or []
+        user_strategies = user_strategies or {}
+        analysis_history = analysis_history or {}
         valid_stocks = [
             stock
             for stock in stocks
@@ -114,10 +215,17 @@ class SharedAnalysisBridge:
             metrics = self._metrics(code, result)
             holding = holdings.get(code, {})
             factor_scores = self.factor_scores(result)
-            score_adjustments = self.quant_adjustments(result, factor_scores)
+            stock_type = self.stock_type(result, code, name)
+            stock_type_weights = self.quant_weights_for_type(stock_type)
+            score_adjustments = self.quant_adjustments(
+                result,
+                factor_scores,
+                stock_type,
+            )
             quant_score = self.quant_score_from_components(
                 factor_scores,
                 score_adjustments,
+                stock_type_weights,
             )
             news_score = self.news_normalized_score(result)
             final_score = (
@@ -130,13 +238,108 @@ class SharedAnalysisBridge:
                 or getattr(result, "price_date", "")
                 or ""
             )
+            price = safe_number(metrics.get("price", 0))
+            target_price = safe_number(getattr(result, "analyst_target_mean", 0))
+            target_upside = self.target_upside(result)
+            data_confidence = self.data_confidence(
+                result,
+                stock_type,
+                price_date,
+                factor_scores,
+            )
+            risk_reasons = [
+                str(item.get("reason", ""))
+                for item in score_adjustments
+                if safe_number(item.get("points", 0)) < 0 and item.get("reason")
+            ]
+            risk_adjustment_penalty_total = sum(
+                safe_number(item.get("points", 0))
+                for item in score_adjustments
+                if safe_number(item.get("points", 0)) < 0
+            )
+            profit_rate = self.profit_rate(price, holding)
+            machine_rating = self.final_grade(result, final_score)
+            action_summary = self.action_summary(
+                final_score,
+                profit_rate,
+                holding,
+                news_score,
+                target_upside,
+            )
+            related_events = self.events_for_stock(events, code)
+            event_warning = self.event_warning(related_events)
+            user_strategy = user_strategies.get(code, {})
+            user_adjusted_action, user_strategy_reason = self.user_adjusted_action(
+                machine_rating,
+                action_summary,
+                user_strategy,
+                profit_rate,
+            )
+            score_change = self.score_change(
+                previous_records.get(code),
+                {
+                    "final_score": final_score,
+                    "quant_score": quant_score,
+                    "news_score": news_score,
+                    "rating": machine_rating,
+                    "factor_scores": factor_scores,
+                    "data_confidence": data_confidence["level"],
+                    "risk_adjustment_penalty_total": risk_adjustment_penalty_total,
+                    "profit_rate": profit_rate,
+                },
+            )
+            action_plan = self.action_plan(
+                result=result,
+                price=price,
+                target_price=target_price,
+                target_upside=target_upside,
+                quant_score=quant_score,
+                news_score=news_score,
+                final_score=final_score,
+                factor_scores=factor_scores,
+                holding=holding,
+            )
+            program_targets = self.program_target_prices(
+                result=result,
+                price=price,
+                final_score=final_score,
+                news_score=news_score,
+                factor_scores=factor_scores,
+                stock_type=stock_type,
+                currency=metrics.get("currency", "KRW"),
+            )
+            downside_scenario = self.downside_scenario(
+                result=result,
+                price=price,
+                final_score=final_score,
+                news_score=news_score,
+                factor_scores=factor_scores,
+                metrics=metrics,
+                data_confidence=data_confidence["level"],
+                currency=metrics.get("currency", "KRW"),
+            )
+            scenario_summary = self.scenario_summary(
+                target_price,
+                program_targets,
+                downside_scenario,
+            )
+            news_items = self.news_items(
+                getattr(result, "name", name) if result else name
+            )
+            daily_snapshot = self.daily_snapshot(
+                result=result,
+                metrics=metrics,
+                news_items=news_items,
+                final_score=final_score,
+                news_score=news_score,
+            )
 
             record = BridgeStockRecord(
                 code=code,
                 name=getattr(result, "name", name) if result else name,
                 market="국내" if code.isdigit() else "해외",
                 asset_type=getattr(result, "asset_type", "STOCK") if result else "STOCK",
-                price=safe_number(metrics.get("price", 0)),
+                price=price,
                 currency=metrics.get("currency", "KRW"),
                 price_date=price_date,
                 freshness_label=self.freshness_label(price_date),
@@ -147,28 +350,69 @@ class SharedAnalysisBridge:
                 quant_score=round(quant_score, 1),
                 news_score=round(news_score, 1),
                 final_score=final_score,
-                grade=self.final_grade(result, final_score),
+                grade=machine_rating,
+                rating=machine_rating,
+                machine_rating=machine_rating,
                 signal=getattr(result, "signal", "-") if result else "분석 대기",
                 analyst=self.analyst_summary(result),
-                target_price=safe_number(
-                    getattr(result, "analyst_target_mean", 0)
-                ),
-                target_upside=self.target_upside(result),
+                target_price=target_price,
+                target_upside=target_upside,
                 comment=self.comment(result, metrics),
-                news=self.news_items(
-                    getattr(result, "name", name) if result else name
-                ),
+                news=news_items,
                 finance=self.finance_summary(result),
+                analyst_target_price=target_price,
+                analyst_target_high=safe_number(getattr(result, "analyst_target_high", 0)),
+                analyst_target_low=safe_number(getattr(result, "analyst_target_low", 0)),
+                program_target_prices=program_targets,
+                downside_scenario=downside_scenario,
+                scenario_summary=scenario_summary,
                 factor_scores=factor_scores,
                 score_reason=self.score_reason(
                     quant_score,
                     news_score,
                     final_score,
                     score_adjustments,
+                    stock_type,
+                    stock_type_weights,
+                    data_confidence,
                 ),
                 score_adjustments=score_adjustments,
+                stock_type=stock_type,
+                stock_type_weights=stock_type_weights,
+                data_confidence=data_confidence["level"],
+                data_confidence_reasons=data_confidence["reasons"],
+                risk_reasons=risk_reasons,
+                risk_adjustment_penalty_total=round(risk_adjustment_penalty_total, 1),
+                profit_rate=profit_rate,
+                action_summary=action_summary,
+                score_change=score_change,
+                previous_final_score=score_change["previous_final_score"],
+                current_final_score=score_change["current_final_score"],
+                final_score_diff=score_change["final_score_diff"],
+                previous_rating=score_change["previous_rating"],
+                current_rating=score_change["current_rating"],
+                rating_changed=score_change["rating_changed"],
+                score_change_reason=score_change["score_change_reason"],
+                events=related_events,
+                event_warning=event_warning,
+                user_strategy=user_strategy,
+                user_adjusted_action=user_adjusted_action,
+                user_strategy_reason=user_strategy_reason,
+                prediction_history=analysis_history.get(code, [])[-5:],
+                analysis_history=analysis_history.get(code, [])[-5:],
+                buy_reason=action_plan["buy_reason"],
+                risk_factors=action_plan["risk_factors"],
+                stop_loss_basis=action_plan["stop_loss_basis"],
+                add_buy_basis=action_plan["add_buy_basis"],
+                hold_reason=action_plan["hold_reason"],
+                next_check_date=action_plan["next_check_date"],
+                daily_status=daily_snapshot["daily_status"],
+                daily_core=daily_snapshot["daily_core"],
+                daily_judgment=daily_snapshot["daily_judgment"],
                 holding_quantity=safe_number(holding.get("quantity", 0)),
-                holding_avg_price=safe_number(holding.get("avg_price", 0)),
+                holding_avg_price=safe_number(
+                    holding.get("average_price", holding.get("avg_price", 0))
+                ),
             )
             return record.to_dict()
 
@@ -189,7 +433,10 @@ class SharedAnalysisBridge:
                 if progress_callback:
                     progress_callback(index, len(valid_stocks), name, code)
 
-                record = future.result()
+                try:
+                    record = future.result()
+                except Exception:
+                    record = None
 
                 if record:
                     records.append(record)
@@ -203,23 +450,126 @@ class SharedAnalysisBridge:
         period: str = "1mo",
         interval: str | None = None,
     ) -> list[float]:
-        try:
-            hist = self.service.price.get_history(
-                stock_code,
-                period=period,
-                interval=interval,
-            )
+        return self.chart_data(
+            stock_code,
+            period=period,
+            interval=interval,
+        ).get("values", [])
 
-            if hist is None or hist.empty or "Close" not in hist:
-                return []
+    def chart_data(
+        self,
+        stock_code: str,
+        period: str = "1mo",
+        interval: str | None = None,
+    ) -> dict[str, Any]:
+        code = str(stock_code or "").strip().upper()
+        candidates = self.chart_ticker_candidates(code)
+        errors = []
 
-            return [
-                safe_number(value)
-                for value in hist["Close"].dropna().tolist()
-                if safe_number(value) > 0
-            ]
-        except Exception:
+        for ticker in candidates:
+            try:
+                hist = self.service.price.get_history(
+                    ticker,
+                    period=period,
+                    interval=interval,
+                )
+            except Exception as exc:
+                errors.append(f"{ticker}: {exc}")
+                continue
+
+            values, points = self.chart_points_from_history(hist)
+
+            if values:
+                return {
+                    "code": code,
+                    "ticker": ticker,
+                    "period": period,
+                    "interval": interval,
+                    "values": values,
+                    "points": points,
+                    "error": None,
+                }
+
+            errors.append(f"{ticker}: 차트 데이터 없음")
+
+        return {
+            "code": code,
+            "ticker": candidates[0] if candidates else code,
+            "period": period,
+            "interval": interval,
+            "values": [],
+            "points": [],
+            "error": "; ".join(errors) if errors else "차트 데이터가 없습니다.",
+        }
+
+    def chart_ticker_candidates(self, stock_code: str) -> list[str]:
+        code = str(stock_code or "").strip().upper()
+
+        if not code:
             return []
+
+        if code.endswith((".KS", ".KQ")):
+            return [code]
+
+        if code.isdigit() and len(code) == 6:
+            suffix = self.chart_market_suffix(code)
+
+            if suffix == ".KQ":
+                return [f"{code}.KQ", f"{code}.KS"]
+
+            return [f"{code}.KS", f"{code}.KQ"]
+
+        return [code]
+
+    def chart_market_suffix(self, stock_code: str) -> str:
+        try:
+            market = self.service.krx.get_market(stock_code) if self.service.krx else ""
+        except Exception:
+            market = ""
+
+        market_text = str(market or "").upper()
+
+        if "KOSDAQ" in market_text or "코스닥" in market_text:
+            return ".KQ"
+
+        return ".KS"
+
+    @staticmethod
+    def chart_points_from_history(hist) -> tuple[list[float], list[dict[str, Any]]]:
+        if hist is None or getattr(hist, "empty", True) or "Close" not in hist:
+            return [], []
+
+        values = []
+        points = []
+
+        for index, close in hist["Close"].dropna().items():
+            price = safe_number(close)
+
+            if not math.isfinite(price) or price <= 0:
+                continue
+
+            date = SharedAnalysisBridge.chart_index_date(index)
+            rounded_price = round(price, 4)
+            values.append(rounded_price)
+            points.append({
+                "date": date,
+                "close": rounded_price,
+            })
+
+        return values, points
+
+    @staticmethod
+    def chart_index_date(value: Any) -> str:
+        try:
+            if hasattr(value, "to_pydatetime"):
+                value = value.to_pydatetime()
+
+            if hasattr(value, "strftime"):
+                return value.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+        return str(value)[:10] if value is not None else ""
 
     def news_items(self, stock_name: str, limit: int = 5) -> list[dict[str, Any]]:
         try:
@@ -290,6 +640,360 @@ class SharedAnalysisBridge:
             for field in fields
         }
 
+    @staticmethod
+    def stock_type(result, code: str = "", name: str = "") -> str:
+        if result is None:
+            return "default"
+
+        code = str(code or getattr(result, "code", "") or "").upper()
+        name = str(name or getattr(result, "name", "") or "").lower()
+        asset_type = str(getattr(result, "asset_type", "STOCK") or "STOCK").upper()
+        market_cap = safe_number(getattr(result, "market_cap", 0))
+        price = safe_number(getattr(result, "price", 0))
+        growth = safe_number(getattr(result, "growth", 0))
+        momentum = safe_number(getattr(result, "momentum", 0))
+
+        if asset_type == "ETF" or str(getattr(result, "is_etf", "")).lower() == "true":
+            return "etf"
+
+        if any(keyword in name for keyword in [
+            "bio",
+            "pharma",
+            "therapeutics",
+            "바이오",
+            "제약",
+        ]):
+            return "biotech"
+
+        if any(keyword in name for keyword in [
+            "증권",
+            "은행",
+            "금융",
+            "financial",
+            "bank",
+            "capital",
+            "securities",
+        ]):
+            return "financial"
+
+        if market_cap >= 10_000_000_000_000 or code in {
+            "AAPL",
+            "MSFT",
+            "NVDA",
+            "GOOGL",
+            "GOOG",
+            "AMZN",
+            "META",
+            "AVGO",
+            "TSM",
+            "005930",
+            "000660",
+        }:
+            return "large_cap"
+
+        if growth >= 40 or momentum >= 35:
+            return "growth"
+
+        if 0 < price < 10 or (0 < market_cap < 500_000_000_000):
+            return "small_cap"
+
+        return "default"
+
+    @staticmethod
+    def quant_weights_for_type(stock_type: str) -> dict[str, float]:
+        return dict(STOCK_TYPE_WEIGHTS.get(stock_type, QUANT_WEIGHTS))
+
+    @staticmethod
+    def data_confidence(
+        result,
+        stock_type: str,
+        price_date: str,
+        factor_scores: dict[str, float],
+    ) -> dict[str, Any]:
+        if result is None:
+            return {"level": "low", "reasons": ["분석 결과 없음"]}
+
+        reasons = []
+        code = str(getattr(result, "code", "") or "").upper()
+        asset_type = str(getattr(result, "asset_type", "STOCK") or "STOCK").upper()
+        per = safe_number(getattr(result, "per", 0))
+        pbr = safe_number(getattr(result, "pbr", 0))
+        roe = safe_number(getattr(result, "roe", 0))
+        market_cap = safe_number(getattr(result, "market_cap", 0))
+        net_income = safe_number(getattr(result, "net_income", 0))
+        missing_fundamentals = (
+            per <= 0
+            and pbr <= 0
+            and roe == 0
+            and market_cap <= 0
+            and net_income == 0
+        )
+        age_days = SharedAnalysisBridge.price_date_age_days(price_date)
+
+        if age_days >= 7:
+            reasons.append(f"가격 기준일 {age_days}일 경과")
+        elif not price_date:
+            reasons.append("가격 기준일 없음")
+
+        if missing_fundamentals:
+            reasons.append("재무 데이터 누락")
+
+        if code and not code.isdigit():
+            reasons.append("해외주식 데이터 해석 주의")
+
+        if asset_type == "ETF" or stock_type == "etf":
+            reasons.append("ETF는 개별기업 재무점수 해석 주의")
+
+        if stock_type == "biotech":
+            reasons.append("바이오/임상주는 뉴스·임상 이벤트 민감")
+
+        if not any(safe_number(value) > 0 for value in factor_scores.values()):
+            reasons.append("팩터 점수 대부분 누락")
+
+        severe_count = sum(
+            1
+            for reason in reasons
+            if "누락" in reason or "없음" in reason or "경과" in reason
+        )
+        level = "low" if severe_count >= 2 else "medium" if reasons else "high"
+        return {"level": level, "reasons": reasons or ["주요 가격/재무 데이터 확인됨"]}
+
+    @staticmethod
+    def profit_rate(price: float, holding: dict[str, Any] | None = None) -> float:
+        holding = holding or {}
+        quantity = safe_number(holding.get("quantity", 0))
+        avg_price = safe_number(
+            holding.get("average_price", holding.get("avg_price", 0))
+        )
+
+        if quantity <= 0 or avg_price <= 0 or price <= 0:
+            return 0.0
+
+        return round(((price - avg_price) / avg_price) * 100, 2)
+
+    @staticmethod
+    def action_summary(
+        final_score: float,
+        profit_rate: float,
+        holding: dict[str, Any] | None,
+        news_score: float,
+        target_upside: float,
+    ) -> str:
+        holding = holding or {}
+        quantity = safe_number(holding.get("quantity", 0))
+
+        if quantity > 0:
+            if news_score <= 35:
+                return "뉴스 리스크 확인 전 추가매수 보류"
+            if profit_rate <= -20:
+                return "손실 확대 구간, 추가매수보다 리스크 재점검"
+            if profit_rate <= -10:
+                return "보유 관찰, 평단 회복 전 추가매수 신중"
+            if profit_rate >= 0 and final_score < 65:
+                return "평단 회복 시 일부 비중 축소 검토"
+            if final_score >= 72 and target_upside > 15:
+                return "보유 유지, 조정 시 분할 추가 관심"
+            return "보유 유지"
+
+        if final_score >= 85:
+            return "강한 관심, 신규 매수는 분할 접근"
+        if final_score >= 72:
+            return "조정 시 관심"
+        if final_score >= 65:
+            return "관심 유지, 추가 확인 필요"
+        if final_score >= 55:
+            return "관망"
+        return "신규 매수 보류"
+
+    @staticmethod
+    def score_change(
+        previous: dict[str, Any] | None,
+        current: dict[str, Any],
+    ) -> dict[str, Any]:
+        current_final = round(safe_number(current.get("final_score", 0)), 1)
+        current_quant = round(safe_number(current.get("quant_score", 0)), 1)
+        current_news = round(safe_number(current.get("news_score", 0)), 1)
+        current_rating = str(current.get("rating") or "")
+
+        if not previous:
+            return {
+                "previous_final_score": None,
+                "current_final_score": current_final,
+                "final_score_diff": None,
+                "previous_quant_score": None,
+                "current_quant_score": current_quant,
+                "quant_score_diff": None,
+                "previous_news_score": None,
+                "current_news_score": current_news,
+                "news_score_diff": None,
+                "previous_rating": None,
+                "current_rating": current_rating,
+                "rating_changed": False,
+                "score_change_reason": "이전 분석 결과가 없어 이번 결과를 기준점으로 저장했습니다.",
+            }
+
+        previous_final = round(safe_number(previous.get("final_score", 0)), 1)
+        previous_quant = round(safe_number(previous.get("quant_score", 0)), 1)
+        previous_news = round(safe_number(previous.get("news_score", 0)), 1)
+        previous_rating = str(previous.get("rating") or previous.get("grade") or "")
+        previous_factors = previous.get("factor_scores") or {}
+        current_factors = current.get("factor_scores") or {}
+        momentum_diff = round(
+            safe_number(current_factors.get("momentum", 0))
+            - safe_number(previous_factors.get("momentum", 0)),
+            1,
+        )
+        confidence_changed = (
+            previous.get("data_confidence")
+            and previous.get("data_confidence") != current.get("data_confidence")
+        )
+        risk_diff = round(
+            safe_number(current.get("risk_adjustment_penalty_total", 0))
+            - safe_number(previous.get("risk_adjustment_penalty_total", 0)),
+            1,
+        )
+        profit_diff = round(
+            safe_number(current.get("profit_rate", 0))
+            - safe_number(previous.get("profit_rate", 0)),
+            1,
+        )
+        final_diff = round(current_final - previous_final, 1)
+        quant_diff = round(current_quant - previous_quant, 1)
+        news_diff = round(current_news - previous_news, 1)
+        reasons = []
+
+        if abs(news_diff) >= 3:
+            reasons.append(f"뉴스 점수 {news_diff:+.1f}점")
+        if abs(quant_diff) >= 3:
+            reasons.append(f"퀀트 점수 {quant_diff:+.1f}점")
+        if abs(momentum_diff) >= 3:
+            reasons.append(f"모멘텀 {momentum_diff:+.1f}점")
+        if confidence_changed:
+            reasons.append(
+                f"데이터 신뢰도 {previous.get('data_confidence')}→{current.get('data_confidence')}"
+            )
+        if abs(risk_diff) >= 2:
+            reasons.append(f"위험 보정 {risk_diff:+.1f}점")
+        if abs(profit_diff) >= 3:
+            reasons.append(f"평단 대비 손익 {profit_diff:+.1f}%")
+
+        rating_changed = bool(previous_rating and previous_rating != current_rating)
+        if rating_changed:
+            reasons.append(f"{previous_rating}에서 {current_rating}로 변경")
+
+        if not reasons:
+            reasons.append("주요 점수 변화는 제한적입니다.")
+
+        return {
+            "previous_final_score": previous_final,
+            "current_final_score": current_final,
+            "final_score_diff": final_diff,
+            "previous_quant_score": previous_quant,
+            "current_quant_score": current_quant,
+            "quant_score_diff": quant_diff,
+            "previous_news_score": previous_news,
+            "current_news_score": current_news,
+            "news_score_diff": news_diff,
+            "previous_rating": previous_rating or None,
+            "current_rating": current_rating,
+            "rating_changed": rating_changed,
+            "score_change_reason": ", ".join(reasons),
+        }
+
+    @staticmethod
+    def events_for_stock(
+        events: list[dict[str, Any]],
+        code: str,
+    ) -> list[dict[str, Any]]:
+        code = str(code or "").upper()
+        normalized = []
+
+        for item in events or []:
+            related_code = str(item.get("related_stock_code") or item.get("code") or "").upper()
+
+            if related_code != code:
+                continue
+
+            normalized.append({
+                "event_title": item.get("event_title") or item.get("title") or "이벤트",
+                "event_type": item.get("event_type") or "기타 사용자 입력 이벤트",
+                "event_date": item.get("event_date") or item.get("date") or "",
+                "importance": item.get("importance") or "medium",
+                "memo": item.get("memo") or "",
+                "related_stock_code": code,
+            })
+
+        return sorted(normalized, key=lambda item: item.get("event_date") or "9999-99-99")
+
+    @staticmethod
+    def event_warning(events: list[dict[str, Any]]) -> str:
+        today = datetime.now().date()
+        upcoming = []
+
+        for item in events or []:
+            try:
+                event_date = datetime.fromisoformat(
+                    str(item.get("event_date", ""))[:10]
+                ).date()
+            except ValueError:
+                continue
+
+            days = (event_date - today).days
+
+            if 0 <= days <= 7:
+                upcoming.append((days, item))
+
+        if not upcoming:
+            return ""
+
+        upcoming.sort(key=lambda value: value[0])
+        days, item = upcoming[0]
+        event_type = str(item.get("event_type") or "")
+
+        if "FDA" in event_type.upper() or "임상" in event_type:
+            return "FDA/임상 관련 일정이 임박했으므로 변동성 확대 가능성이 있습니다."
+
+        importance = str(item.get("importance") or "medium").lower()
+        if importance == "high":
+            return f"{days}일 이내 중요 이벤트가 있습니다."
+
+        return f"{days}일 이내 이벤트가 있습니다."
+
+    @staticmethod
+    def user_adjusted_action(
+        machine_rating: str,
+        action_summary: str,
+        user_strategy: dict[str, Any] | None,
+        profit_rate: float,
+    ) -> tuple[str, str]:
+        user_strategy = user_strategy or {}
+        strategy = str(
+            user_strategy.get("strategy")
+            or user_strategy.get("name")
+            or user_strategy.get("type")
+            or ""
+        ).strip()
+
+        if not strategy:
+            return action_summary, "사용자 전략이 없어 기계적 판단을 그대로 사용했습니다."
+
+        if "장기" in strategy:
+            return "보유 유지", "사용자가 장기 보유 전략을 설정했습니다."
+        if "손절하지" in strategy:
+            return "보유 유지", "사용자가 손절하지 않음 전략을 설정했습니다."
+        if "목표가" in strategy:
+            return "목표가 도달 시 일부 매도", "사용자가 목표가 도달 시 일부 매도 전략을 설정했습니다."
+        if "평단" in strategy:
+            if profit_rate >= 0:
+                return "평단 회복, 일부 비중 축소 검토", "사용자가 평단 회복 시 일부 비중 축소 전략을 설정했습니다."
+            return "평단 회복 전 보유 관찰", "사용자가 평단 회복 시 일부 비중 축소 전략을 설정했습니다."
+        if "정기" in strategy or "매달" in strategy:
+            return "정기 매수 유지, 과열 구간은 금액 축소", "사용자가 정기 매수 전략을 설정했습니다."
+        if "이벤트" in strategy:
+            return "이벤트 전 일부 매도 검토", "사용자가 이벤트 전 일부 매도 전략을 설정했습니다."
+
+        return action_summary, f"사용자 전략 '{strategy}'을 참고하되 기계적 등급 {machine_rating}을 함께 확인합니다."
+
     def _analyze(self, code: str, preset: str):
         try:
             analyzer = StockAnalyzer(self.service)
@@ -321,13 +1025,20 @@ class SharedAnalysisBridge:
             return 0.0
 
         factor_scores = SharedAnalysisBridge.factor_scores(result)
+        stock_type = SharedAnalysisBridge.stock_type(
+            result,
+            str(getattr(result, "code", "") or ""),
+            str(getattr(result, "name", "") or ""),
+        )
         score_adjustments = SharedAnalysisBridge.quant_adjustments(
             result,
             factor_scores,
+            stock_type,
         )
         return SharedAnalysisBridge.quant_score_from_components(
             factor_scores,
             score_adjustments,
+            SharedAnalysisBridge.quant_weights_for_type(stock_type),
         )
 
     @staticmethod
@@ -360,10 +1071,12 @@ class SharedAnalysisBridge:
     def quant_score_from_components(
         factor_scores: dict[str, float],
         adjustments: list[dict[str, Any]] | None = None,
+        weights: dict[str, float] | None = None,
     ) -> float:
+        weights = weights or QUANT_WEIGHTS
         weighted_score = sum(
             max(min(safe_number(factor_scores.get(name, 0)), 100), 0) * weight
-            for name, weight in QUANT_WEIGHTS.items()
+            for name, weight in weights.items()
         )
         adjustment_total = sum(
             safe_number(item.get("points", 0))
@@ -376,43 +1089,35 @@ class SharedAnalysisBridge:
     def quant_adjustments(
         result,
         factor_scores: dict[str, float],
+        stock_type: str = "default",
     ) -> list[dict[str, Any]]:
         if result is None:
             return []
 
-        adjustments: list[dict[str, Any]] = []
+        penalty_adjustments: list[dict[str, Any]] = []
+        bonus_adjustments: list[dict[str, Any]] = []
         code = str(getattr(result, "code", "") or "").upper()
         name = str(getattr(result, "name", "") or "").lower()
         asset_type = str(getattr(result, "asset_type", "STOCK") or "STOCK").upper()
         net_income = safe_number(getattr(result, "net_income", 0))
         price = safe_number(getattr(result, "price", 0))
-        per = safe_number(getattr(result, "per", 0))
-        pbr = safe_number(getattr(result, "pbr", 0))
-        roe = safe_number(getattr(result, "roe", 0))
-        market_cap = safe_number(getattr(result, "market_cap", 0))
 
-        if asset_type == "ETF" or str(getattr(result, "is_etf", "")).lower() == "true":
-            adjustments.append({
+        if stock_type == "etf":
+            penalty_adjustments.append({
                 "type": "asset_type",
-                "points": -6,
-                "reason": "ETF는 개별기업 재무팩터보다 구성자산과 추세가 중요해 보수 조정",
+                "points": -3,
+                "reason": "ETF는 개별기업 재무팩터 해석 주의",
             })
 
         if net_income < 0 and asset_type != "ETF":
-            adjustments.append({
+            penalty_adjustments.append({
                 "type": "loss",
                 "points": -8,
                 "reason": "순이익 적자 기업은 품질/안정성 위험을 추가 반영",
             })
 
-        if any(keyword in name for keyword in [
-            "bio",
-            "pharma",
-            "therapeutics",
-            "바이오",
-            "제약",
-        ]):
-            adjustments.append({
+        if stock_type == "biotech":
+            penalty_adjustments.append({
                 "type": "biotech",
                 "points": -4,
                 "reason": "바이오/제약주는 임상·뉴스 변동성이 커 보수 조정",
@@ -424,34 +1129,32 @@ class SharedAnalysisBridge:
             and factor_scores.get("value", 0) < 40
             and asset_type != "ETF"
         ):
-            adjustments.append({
+            bonus_adjustments.append({
                 "type": "growth_stock",
                 "points": 4,
                 "reason": "가치점수는 낮지만 성장·모멘텀이 강한 성장주 보정",
             })
 
-        missing_fundamentals = (
-            per <= 0
-            and pbr <= 0
-            and roe == 0
-            and market_cap <= 0
-        )
-
-        if code and not code.isdigit() and missing_fundamentals and asset_type != "ETF":
-            adjustments.append({
-                "type": "overseas_data",
-                "points": -4,
-                "reason": "해외주식 재무 데이터가 부족해 신뢰도 보수 조정",
-            })
-
         if price > 0 and price < 10 and asset_type != "ETF":
-            adjustments.append({
+            penalty_adjustments.append({
                 "type": "speculative_price",
                 "points": -3,
                 "reason": "저가 변동성 종목은 투기성 위험을 일부 반영",
             })
 
-        return adjustments
+        penalty_total = sum(
+            safe_number(item.get("points", 0))
+            for item in penalty_adjustments
+        )
+
+        if penalty_total < -15:
+            scale = 15 / abs(penalty_total)
+            for item in penalty_adjustments:
+                item["original_points"] = item["points"]
+                item["points"] = round(safe_number(item["points"]) * scale, 1)
+                item["capped"] = True
+
+        return penalty_adjustments + bonus_adjustments
 
     @staticmethod
     def score_reason(
@@ -459,13 +1162,33 @@ class SharedAnalysisBridge:
         news_score: float,
         final_score: float,
         adjustments: list[dict[str, Any]] | None = None,
+        stock_type: str = "default",
+        stock_type_weights: dict[str, float] | None = None,
+        data_confidence: dict[str, Any] | None = None,
     ) -> str:
         reason = (
             f"퀀트 {quant_score:.1f}점, 뉴스 {news_score:.1f}점, "
-            f"최종 {final_score:.1f}점"
+            f"최종 {final_score:.1f}점 = 퀀트 70% + 뉴스 30%"
         )
+        weights = stock_type_weights or QUANT_WEIGHTS
+        reason += (
+            f" | 유형 {stock_type}"
+            f" | 가중치 가치 {weights.get('value', 0) * 100:.0f}%"
+            f"/품질 {weights.get('quality', 0) * 100:.0f}%"
+            f"/성장 {weights.get('growth', 0) * 100:.0f}%"
+            f"/안정 {weights.get('stability', 0) * 100:.0f}%"
+            f"/모멘텀 {weights.get('momentum', 0) * 100:.0f}%"
+            f"/배당 {weights.get('dividend', 0) * 100:.0f}%"
+        )
+        if data_confidence:
+            confidence_reasons = ", ".join(data_confidence.get("reasons", [])[:3])
+            reason += (
+                f" | 데이터 신뢰도 {data_confidence.get('level', 'medium')}"
+                f"({confidence_reasons})"
+            )
+
         labels = [
-            f"{item.get('reason', '')}({safe_number(item.get('points', 0)):+.0f})"
+            f"{item.get('reason', '')}({safe_number(item.get('points', 0)):+.1f})"
             for item in adjustments or []
             if item.get("reason")
         ]
@@ -476,6 +1199,293 @@ class SharedAnalysisBridge:
         return reason
 
     @staticmethod
+    def action_plan(
+        result,
+        price: float,
+        target_price: float,
+        target_upside: float,
+        quant_score: float,
+        news_score: float,
+        final_score: float,
+        factor_scores: dict[str, float],
+        holding: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
+        holding = holding or {}
+        momentum = safe_number(factor_scores.get("momentum", 0))
+        growth = safe_number(factor_scores.get("growth", 0))
+        quality = safe_number(factor_scores.get("quality", 0))
+        stability = safe_number(factor_scores.get("stability", 0))
+        value = safe_number(factor_scores.get("value", 0))
+        quantity = safe_number(holding.get("quantity", 0))
+        avg_price = safe_number(
+            holding.get("average_price", holding.get("avg_price", 0))
+        )
+        change_1d = safe_number(getattr(result, "change_rate", 0)) if result else 0
+
+        if final_score >= 72:
+            buy_reason = "최종 점수가 높고 퀀트/뉴스 흐름이 우호적입니다."
+        elif quant_score >= 70 and news_score < 55:
+            buy_reason = "퀀트 조건은 양호하지만 뉴스 확인 후 접근이 필요합니다."
+        elif news_score >= 70 and quant_score < 55:
+            buy_reason = "뉴스 흐름은 좋지만 가격/재무 신호 확인이 필요합니다."
+        else:
+            buy_reason = "매수보다는 관찰 우선 구간입니다."
+
+        risks = []
+        if news_score < 45:
+            risks.append("뉴스 점수 약세")
+        if stability < 45:
+            risks.append("안정성 점수 낮음")
+        if momentum < 45:
+            risks.append("모멘텀 약세")
+        if value < 35 and growth < 60:
+            risks.append("밸류에이션 부담")
+        if target_price <= 0:
+            risks.append("목표가 데이터 부족")
+        if abs(change_1d) >= 7:
+            risks.append("단기 변동성 확대")
+        risk_factors = ", ".join(risks) if risks else "뚜렷한 위험 신호는 제한적입니다."
+
+        stop_base = avg_price if avg_price > 0 else price
+        stop_price = stop_base * 0.9 if stop_base > 0 else 0
+        if stop_price > 0:
+            stop_loss_basis = f"기준가 대비 -10% 부근({stop_price:,.0f}) 이탈 시 재점검"
+        else:
+            stop_loss_basis = "현재가 확인 후 -10% 기준으로 설정"
+
+        if final_score >= 72 and momentum >= 55:
+            add_buy_basis = "20일선 또는 단기 지지 확인 후 분할 추가 매수"
+        elif final_score >= 55:
+            add_buy_basis = "뉴스와 모멘텀이 개선될 때만 소액 분할"
+        else:
+            add_buy_basis = "추가 매수보다 리스크 확인 우선"
+
+        if quantity > 0:
+            if final_score >= 60:
+                hold_reason = "보유 중이면 점수와 목표가를 보며 유지 검토"
+            else:
+                hold_reason = "보유 중이면 비중 축소 또는 손절 기준 점검"
+        else:
+            hold_reason = "미보유 종목은 관심종목으로 관찰"
+
+        check_days = 3 if risks or final_score < 55 else 7
+        next_check_date = (datetime.now().date() + timedelta(days=check_days)).isoformat()
+
+        return {
+            "buy_reason": buy_reason,
+            "risk_factors": risk_factors,
+            "stop_loss_basis": stop_loss_basis,
+            "add_buy_basis": add_buy_basis,
+            "hold_reason": hold_reason,
+            "next_check_date": next_check_date,
+        }
+
+    @staticmethod
+    def program_target_prices(
+        result,
+        price: float,
+        final_score: float,
+        news_score: float,
+        factor_scores: dict[str, float],
+        stock_type: str,
+        currency: str = "KRW",
+    ) -> dict[str, Any]:
+        if price <= 0:
+            return {
+                "conservative": 0,
+                "base": 0,
+                "aggressive": 0,
+                "currency": currency,
+                "basis": "현재가 데이터가 없어 프로그램 산출 목표가를 만들 수 없습니다.",
+                "method": "기술적 저항선 + 퀀트/뉴스 점수 + 종목 유형 보정",
+            }
+
+        momentum = safe_number(factor_scores.get("momentum", 0))
+        growth = safe_number(factor_scores.get("growth", 0))
+        stability = safe_number(factor_scores.get("stability", 0))
+        high52 = safe_number(getattr(result, "high52", 0)) if result else 0
+        ma20 = safe_number(getattr(result, "ma20", 0)) if result else 0
+        ma60 = safe_number(getattr(result, "ma60", 0)) if result else 0
+
+        type_factor = {
+            "large_cap": 0.92,
+            "financial": 0.9,
+            "etf": 0.75,
+            "growth": 1.18,
+            "biotech": 1.28,
+            "small_cap": 1.15,
+        }.get(stock_type, 1.0)
+        score_factor = max(min((final_score - 55) / 100, 0.28), -0.10)
+        momentum_factor = max(min((momentum - 50) / 100, 0.18), -0.08)
+        news_factor = max(min((news_score - 50) / 180, 0.10), -0.08)
+        growth_factor = max(min((growth - 50) / 220, 0.07), -0.04)
+        stability_drag = -0.04 if stability < 40 else 0
+        base_bonus = (score_factor + momentum_factor + news_factor + growth_factor + stability_drag) * type_factor
+
+        conservative_pct = max(min(0.05 + base_bonus * 0.45, 0.18), 0.03)
+        base_pct = max(min(0.10 + base_bonus * 0.75, 0.32), 0.05)
+        aggressive_pct = max(min(0.18 + base_bonus, 0.55), 0.08)
+
+        conservative = price * (1 + conservative_pct)
+        base = price * (1 + base_pct)
+        aggressive = price * (1 + aggressive_pct)
+
+        resistance_candidates = [
+            value
+            for value in [ma20, ma60, high52]
+            if value > price
+        ]
+
+        if resistance_candidates:
+            nearest_resistance = min(resistance_candidates)
+            conservative = max(conservative, nearest_resistance * 0.98)
+            base = max(base, nearest_resistance)
+
+        if high52 > price:
+            aggressive = max(aggressive, high52)
+        elif high52 > 0 and price >= high52:
+            aggressive = max(aggressive, price * (1 + aggressive_pct * 0.75))
+
+        targets = {
+            "conservative": round(conservative, 2),
+            "base": round(max(base, conservative), 2),
+            "aggressive": round(max(aggressive, base, conservative), 2),
+            "currency": currency,
+            "method": "기술적 저항선 + 퀀트/뉴스 점수 + 종목 유형 보정",
+            "basis": (
+                "보수 목표가는 가까운 저항선/단기 회복 구간, 기준 목표가는 "
+                "60~120일 추세와 점수 보정, 공격 목표가는 52주 고점 또는 강한 모멘텀을 반영합니다."
+            ),
+            "reason": (
+                f"최종 {final_score:.1f}점, 뉴스 {news_score:.1f}점, "
+                f"모멘텀 {momentum:.1f}점, 성장 {growth:.1f}점, 유형 {stock_type}을 반영했습니다."
+            ),
+        }
+        return targets
+
+    @staticmethod
+    def downside_scenario(
+        result,
+        price: float,
+        final_score: float,
+        news_score: float,
+        factor_scores: dict[str, float],
+        metrics: dict[str, Any],
+        data_confidence: str,
+        currency: str = "KRW",
+    ) -> dict[str, Any]:
+        if price <= 0:
+            return {
+                "risk_level": "unknown",
+                "support_1": 0,
+                "support_2": 0,
+                "stop_check": 0,
+                "currency": currency,
+                "reasons": ["현재가 데이터가 없어 하락 시나리오를 만들 수 없습니다."],
+                "summary": "하락 시나리오 산출 불가",
+            }
+
+        momentum = safe_number(factor_scores.get("momentum", 0))
+        stability = safe_number(factor_scores.get("stability", 0))
+        ma20 = safe_number(getattr(result, "ma20", 0)) if result else 0
+        ma60 = safe_number(getattr(result, "ma60", 0)) if result else 0
+        low52 = safe_number(getattr(result, "low52", 0)) if result else 0
+        change_1d = safe_number(metrics.get("change_1d", 0))
+        change_1m = safe_number(metrics.get("change_1m", 0))
+        change_3m = safe_number(metrics.get("change_3m", 0))
+        volume_ratio = safe_number(getattr(result, "volume_ratio", 0)) if result else 0
+
+        support_candidates = [
+            value
+            for value in [ma20, ma60, low52]
+            if 0 < value < price
+        ]
+        support_candidates.sort(reverse=True)
+        support_1 = support_candidates[0] if support_candidates else price * 0.92
+        support_2 = (
+            support_candidates[1]
+            if len(support_candidates) >= 2
+            else min(support_1 * 0.94, price * 0.85)
+        )
+        stop_check = min(support_2, price * 0.90)
+
+        risk_points = 0
+        reasons = []
+
+        if final_score < 55:
+            risk_points += 2
+            reasons.append("최종 점수가 HOLD 기준 아래라 방어적 대응이 필요합니다.")
+        if news_score < 40:
+            risk_points += 2
+            reasons.append("뉴스 점수가 낮아 악재성 흐름을 확인해야 합니다.")
+        if momentum < 45:
+            risk_points += 2
+            reasons.append("모멘텀 점수가 약해 단기 추세 이탈 가능성이 있습니다.")
+        if stability < 40:
+            risk_points += 1
+            reasons.append("안정성 점수가 낮아 변동성 확대에 취약합니다.")
+        if change_1d <= -5:
+            risk_points += 2
+            reasons.append("하루 -5% 이상 하락 신호가 있습니다.")
+        if change_1m <= -10 or change_3m <= -15:
+            risk_points += 1
+            reasons.append("1~3개월 가격 흐름이 약세입니다.")
+        if volume_ratio >= 1.8 and change_1d < 0:
+            risk_points += 1
+            reasons.append("거래량 증가를 동반한 하락은 추가 매도 압력 신호일 수 있습니다.")
+        if data_confidence == "low":
+            reasons.append("데이터 신뢰도가 낮아 해석에 주의가 필요합니다.")
+
+        if risk_points >= 6:
+            risk_level = "high"
+            level_text = "높음"
+        elif risk_points >= 3:
+            risk_level = "medium"
+            level_text = "중간"
+        else:
+            risk_level = "low"
+            level_text = "낮음"
+            if not reasons:
+                reasons.append("강한 하락 위험 신호는 제한적입니다.")
+
+        return {
+            "risk_level": risk_level,
+            "support_1": round(support_1, 2),
+            "support_2": round(support_2, 2),
+            "stop_check": round(stop_check, 2),
+            "currency": currency,
+            "reasons": reasons,
+            "method": "이동평균/52주 저점 기반 지지선 + 점수/뉴스/거래량 위험 신호",
+            "summary": (
+                f"하락 위험도 {level_text}. 1차 지지선 {SharedAnalysisBridge.format_price(support_1, currency)}, "
+                f"2차 지지선 {SharedAnalysisBridge.format_price(support_2, currency)} 부근을 확인합니다."
+            ),
+        }
+
+    @staticmethod
+    def scenario_summary(
+        analyst_target: float,
+        program_targets: dict[str, Any],
+        downside: dict[str, Any],
+    ) -> str:
+        analyst_text = (
+            "애널리스트 목표가 있음"
+            if analyst_target > 0
+            else "애널리스트 목표가 없음"
+        )
+        base = safe_number(program_targets.get("base", 0))
+        currency = program_targets.get("currency", "KRW")
+        base_text = (
+            SharedAnalysisBridge.format_price(base, currency)
+            if base > 0
+            else "산출 불가"
+        )
+        return (
+            f"{analyst_text} | 프로그램 기준 목표가 {base_text} | "
+            f"{downside.get('summary', '하락 시나리오 없음')}"
+        )
+
+    @staticmethod
     def news_normalized_score(result) -> float:
         if result is None:
             return 0.0
@@ -483,6 +1493,94 @@ class SharedAnalysisBridge:
         raw_news = safe_number(getattr(result, "news", 0))
         raw_news = max(min(raw_news, 20), -20)
         return ((raw_news + 20) / 40) * 100
+
+    @staticmethod
+    def daily_snapshot(
+        result,
+        metrics: dict[str, Any],
+        news_items: list[dict[str, Any]],
+        final_score: float,
+        news_score: float,
+    ) -> dict[str, str]:
+        if final_score >= 85:
+            status = "강한 관심"
+            judgment = "보유 유지 / 신규 매수는 분할 접근"
+        elif final_score >= 72:
+            status = "관심"
+            judgment = "보유 유지 / 조정 시 분할 추가매수"
+        elif final_score >= 65:
+            status = "관심 관찰"
+            judgment = "관심 유지 / 추가 확인 후 분할 접근"
+        elif final_score >= 55:
+            status = "관망"
+            judgment = "보유 유지 / 추가매수는 조정 시"
+        elif final_score >= 40:
+            status = "주의"
+            judgment = "보유 비중 점검 / 신규 매수 보류"
+        else:
+            status = "위험"
+            judgment = "비중 축소 또는 관망"
+
+        positive = next(
+            (
+                item
+                for item in news_items
+                if "호재" in str(item.get("impact_label", ""))
+                or safe_number(item.get("impact_score", 0)) >= 4
+            ),
+            None,
+        )
+        negative = next(
+            (
+                item
+                for item in news_items
+                if "악재" in str(item.get("impact_label", ""))
+                or safe_number(item.get("impact_score", 0)) <= -4
+            ),
+            None,
+        )
+
+        if positive and negative:
+            core = (
+                f"{SharedAnalysisBridge.short_news_title(positive)}는 호재, "
+                f"{SharedAnalysisBridge.short_news_title(negative)}는 부담"
+            )
+        elif positive:
+            core = f"{SharedAnalysisBridge.short_news_title(positive)}가 호재"
+        elif negative:
+            core = f"{SharedAnalysisBridge.short_news_title(negative)}가 부담"
+        else:
+            change_1d = safe_number(metrics.get("change_1d", 0))
+            change_1m = safe_number(metrics.get("change_1m", 0))
+
+            if news_score >= 65:
+                core = "뉴스 흐름은 우호적이나 가격 확인 필요"
+            elif news_score <= 35:
+                core = "뉴스 흐름이 부담으로 작용"
+            elif change_1d <= -5:
+                core = "단기 하락이 커서 지지 확인 필요"
+            elif change_1m >= 8:
+                core = "1개월 추세 회복이 핵심"
+            else:
+                core = "뚜렷한 단기 재료는 제한적이고 가격 흐름 확인 필요"
+
+        return {
+            "daily_status": status,
+            "daily_core": core,
+            "daily_judgment": judgment,
+        }
+
+    @staticmethod
+    def short_news_title(news: dict[str, Any], limit: int = 28) -> str:
+        title = " ".join(str(news.get("title", "")).split())
+
+        if not title:
+            return "해당 뉴스"
+
+        if len(title) > limit:
+            return title[:limit].rstrip() + "..."
+
+        return title
 
     @staticmethod
     def final_grade(result, final_score: float) -> str:
@@ -498,7 +1596,9 @@ class SharedAnalysisBridge:
         if final_score >= 85:
             return "STRONG BUY"
         if final_score >= 72:
-            return "SPEC BUY" if speculative else "BUY"
+            return "BUY"
+        if final_score >= 65:
+            return "WATCH BUY"
         if final_score >= 55:
             return "HOLD"
         if final_score >= 40:

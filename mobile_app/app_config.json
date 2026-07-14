@@ -7,13 +7,14 @@
     "bundle_id":  "com.kck.morningstock",
     "company_name":  "kck",
     "build_version":  "0.1.0",
-    "build_number":  "8",
+    "build_number":  "16",
     "splash_color":  "#f7f8fb",
     "android_adaptive_icon_background":  "#2563eb",
     "icon_path":  "assets/icon.png",
     "adaptive_icon_foreground_path":  "assets/adaptive_icon_foreground.png",
     "splash_path":  "assets/splash.png",
+    "default_server_url":  "https://morning-stock-api-613090042286.asia-northeast3.run.app",
     "android_permissions":  [
-
+                                "android.permission.INTERNET=true"
                             ]
 }

@@ -6,6 +6,7 @@ import json
 import random
 import sys
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -18,7 +19,21 @@ DEV_STORAGE_DIR = APP_ROOT / "storage"
 DEV_WATCHLIST_FILE = DEV_STORAGE_DIR / "watchlist.json"
 DEV_HOLDINGS_FILE = DEV_STORAGE_DIR / "holdings.json"
 APP_CONFIG_FILE = Path(__file__).resolve().parent / "app_config.json"
-DEFAULT_SERVER_URL = "https://stock-z1su.onrender.com"
+
+
+def load_default_server_url():
+    try:
+        config = json.loads(APP_CONFIG_FILE.read_text(encoding="utf-8-sig"))
+    except Exception:
+        config = {}
+
+    return str(
+        config.get("default_server_url")
+        or ""
+    ).strip().rstrip("/")
+
+
+DEFAULT_SERVER_URL = load_default_server_url()
 
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
@@ -71,9 +86,12 @@ class MobileStockApp:
         first_stock = self.current_stocks()[0] if self.current_stocks() else {}
         self.selected_chart_code = first_stock.get("code", "")
         self.selected_holding_code = first_stock.get("code", "")
+        self.selected_news_code = first_stock.get("code", "")
+        self.selected_detail_code = ""
+        self.selected_detail_tab = "요약"
         self.stock_preview = None
         self.stock_search_results = []
-        self.chart_period = "1개월"
+        self.chart_period = "한달"
         self.chart_selected_index = None
         self.chart_selected_price = None
         self.bridge = None
@@ -81,10 +99,14 @@ class MobileStockApp:
         self.real_chart_cache = {}
         self.real_data_loaded_at = ""
         self.real_data_error = ""
-        self.api_base_url = str(
+        saved_api_base_url = str(
             self.app_settings.get("api_base_url", DEFAULT_SERVER_URL)
-        ).strip()
+        ).strip().rstrip("/")
+        self.api_base_url = self.normalized_server_url(saved_api_base_url)
         self.alerts = []
+        self.selected_alert = None
+        self.alert_filter = "전체"
+        self.alert_expanded = False
         self.alert_history = set()
         self.alert_threshold_score = safe_number(
             self.app_settings.get("alert_threshold_score", 75),
@@ -151,9 +173,19 @@ class MobileStockApp:
         self.auto_refresh_enabled = bool(
             self.app_settings.get("auto_refresh_enabled", True)
         )
+        saved_auto_interval = int(
+            safe_number(
+                self.app_settings.get("auto_refresh_interval_minutes", 20),
+                20,
+            )
+        )
+
+        if saved_auto_interval in (5, 30):
+            saved_auto_interval = 20
+
         self.auto_refresh_interval_minutes = max(
             1,
-            int(safe_number(self.app_settings.get("auto_refresh_interval_minutes", 30), 30)),
+            saved_auto_interval,
         )
         self.auto_refresh_started = False
         self.status_watcher_started = False
@@ -218,8 +250,8 @@ class MobileStockApp:
             self.auto_refresh_interval_minutes,
         )
         self.api_base_url_input = ft.TextField(
-            label="Render 서버 URL",
-            hint_text="https://your-service.onrender.com",
+            label="분석 서버 URL",
+            hint_text="https://your-service-url",
             value=self.api_base_url,
             dense=True,
         )
@@ -284,7 +316,14 @@ class MobileStockApp:
                 break
 
         if base_path is None:
-            base_path = Path.home() / ".morning_stock_mobile"
+            app_file = Path(__file__).resolve()
+            parts = [part.lower() for part in app_file.parts]
+
+            if "files" in parts:
+                files_index = parts.index("files")
+                base_path = Path(*app_file.parts[: files_index + 1])
+            else:
+                base_path = app_file.parent / ".morning_stock_mobile"
 
         return base_path / "storage"
 
@@ -296,9 +335,16 @@ class MobileStockApp:
 
         storage_sources = [
             Path(__file__).resolve().parent / "storage",
-            Path.home() / ".morning_stock_mobile" / "storage",
             DEV_STORAGE_DIR,
         ]
+
+        try:
+            legacy_home_storage = Path.home() / ".morning_stock_mobile" / "storage"
+
+            if legacy_home_storage.parent.parent != Path("/"):
+                storage_sources.insert(1, legacy_home_storage)
+        except Exception:
+            pass
 
         file_pairs = [
             ("watchlist.json", self.watchlist_file),
@@ -344,6 +390,14 @@ class MobileStockApp:
             return "PC 개발 저장소"
 
         return "앱 내부 저장소"
+
+    def normalized_server_url(self, value):
+        value = str(value or "").strip().rstrip("/")
+
+        if not value or value == "https://stock-z1su.onrender.com":
+            return DEFAULT_SERVER_URL
+
+        return value
 
     def on_nav_change(self, event):
         self.selected_index = event.control.selected_index
@@ -466,6 +520,22 @@ class MobileStockApp:
             on_click=on_click,
         )
 
+    def small_primary_button(self, text, on_click):
+        return ft.Container(
+            content=ft.Text(
+                text,
+                color="#ffffff",
+                weight=ft.FontWeight.BOLD,
+                size=11,
+                max_lines=1,
+            ),
+            padding=ft.Padding(10, 6, 10, 6),
+            bgcolor="#2563eb",
+            border_radius=8,
+            ink=True,
+            on_click=on_click,
+        )
+
     def number_field(self, label, value):
         return ft.TextField(
             label=label,
@@ -531,6 +601,8 @@ class MobileStockApp:
             return "STRONG BUY"
         if score >= 72:
             return "BUY"
+        if score >= 65:
+            return "WATCH BUY"
         if score >= 55:
             return "HOLD"
         if score >= 40:
@@ -640,6 +712,28 @@ class MobileStockApp:
     def on_group_change(self, event):
         self.selected_group = event.control.value or ""
         self.stock_preview = None
+        self.ensure_selected_stock_codes()
+        self.render()
+
+    def ensure_selected_stock_codes(self):
+        stocks = self.current_stocks()
+        codes = {item.get("code") for item in stocks}
+        first = stocks[0] if stocks else {}
+        fallback = first.get("code", "")
+
+        if self.selected_chart_code not in codes:
+            self.selected_chart_code = fallback
+
+        if self.selected_holding_code not in codes:
+            self.selected_holding_code = fallback
+
+        if self.selected_news_code not in codes:
+            self.selected_news_code = fallback
+
+    def select_stock_for_details(self, code):
+        self.selected_chart_code = code
+        self.selected_holding_code = code
+        self.selected_news_code = code
         self.render()
 
     def home_view(self):
@@ -679,6 +773,7 @@ class MobileStockApp:
                     ],
                     spacing=10,
                 ),
+                self.portfolio_exposure_panel(),
                 self.alert_panel(),
                 self.portfolio_feedback_panel(),
                 ft.Text("점수 상위", weight=ft.FontWeight.BOLD, size=16),
@@ -700,6 +795,619 @@ class MobileStockApp:
             spacing=14,
             scroll=ft.ScrollMode.AUTO,
         )
+
+    def home_holding_stock_items(self, ranked):
+        held_codes = {
+            str(code).upper()
+            for code, holding in self.holdings.items()
+            if safe_number(holding.get("quantity", 0)) > 0
+        }
+        held = [
+            item for item in ranked
+            if str(item.get("code", "")).upper() in held_codes
+        ]
+        others = [
+            item for item in ranked
+            if str(item.get("code", "")).upper() not in held_codes
+        ]
+        return held + others[: max(0, 8 - len(held))]
+
+    def home_briefing_summary(self, stocks):
+        records = [
+            self.record_for_item(item)
+            for item in stocks
+        ]
+        attention = sum(
+            1 for record in records
+            if record["final_score"] >= 65
+        )
+        upside = sum(
+            1 for record in records
+            if record["final_score"] >= 72
+            or safe_number((record["real"] or {}).get("target_upside", 0)) >= 20
+        )
+        risk = sum(
+            1 for record in records
+            if record["final_score"] < 55
+            or safe_number((record["real"] or {}).get("final_score_diff", 0)) <= -5
+            or (record["real"] or {}).get("data_confidence") == "low"
+        )
+        events = sum(
+            1 for record in records
+            if (record["real"] or {}).get("event_warning")
+        )
+        best = max(records, key=lambda item: item["final_score"], default=None)
+        risk_item = min(records, key=lambda item: item["final_score"], default=None)
+        headline = "새로고침 후 오늘의 브리핑을 확인하세요."
+
+        if best:
+            headline = (
+                f"{best['name']} {best['grade']} {best['final_score']:.0f}점"
+            )
+
+            if risk_item and risk_item["final_score"] < 55:
+                headline += f" · {risk_item['name']} 리스크 점검"
+
+        return {
+            "headline": headline,
+            "attention": attention,
+            "upside": upside,
+            "risk": risk,
+            "events": events,
+            "records": records,
+        }
+
+    def mobile_summary_panel(self, summary):
+        return self.card(
+            ft.Column(
+                [
+                    ft.Text("오늘의 브리핑", weight=ft.FontWeight.BOLD, size=15),
+                    ft.Text(summary["headline"], size=13, color="#334155"),
+                    ft.Text(
+                        f"실제 데이터 갱신: {self.real_data_loaded_at or '아직 없음'}",
+                        size=11,
+                        color="#94a3b8",
+                    ),
+                ],
+                spacing=5,
+            ),
+            padding=13,
+            bgcolor="#eef6ff",
+        )
+
+    def mobile_summary_metric_grid(self, summary):
+        return ft.Column(
+            [
+                ft.Row(
+                    [
+                        self.compact_metric_card("관심 필요", f"{summary['attention']}개"),
+                        self.compact_metric_card("상승 후보", f"{summary['upside']}개"),
+                    ],
+                    spacing=8,
+                ),
+                ft.Row(
+                    [
+                        self.compact_metric_card("위험 증가", f"{summary['risk']}개"),
+                        self.compact_metric_card("중요 이벤트", f"{summary['events']}개"),
+                    ],
+                    spacing=8,
+                ),
+            ],
+            spacing=8,
+        )
+
+    def compact_metric_card(self, title, value):
+        return ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text(title, size=11, color="#64748b"),
+                    ft.Text(value, size=18, weight=ft.FontWeight.BOLD, color="#111827"),
+                ],
+                spacing=2,
+            ),
+            padding=12,
+            bgcolor="#ffffff",
+            border_radius=12,
+            border=ft.Border(
+                left=ft.BorderSide(1, "#eef2f7"),
+                top=ft.BorderSide(1, "#eef2f7"),
+                right=ft.BorderSide(1, "#eef2f7"),
+                bottom=ft.BorderSide(1, "#eef2f7"),
+            ),
+            expand=True,
+        )
+
+    def record_for_item(self, item):
+        code = str(item.get("code", "")).upper()
+        real = self.real_record(code)
+        final_score = self.final_score_for(code)
+        return {
+            "item": item,
+            "code": code,
+            "name": item.get("name", code),
+            "real": real,
+            "quant_score": self.score_for(code),
+            "news_score": self.news_score_for(code),
+            "final_score": final_score,
+            "grade": (real or {}).get("rating") or (real or {}).get("grade") or self.grade_for(final_score),
+        }
+
+    def mobile_stock_card(self, item):
+        record = self.record_for_item(item)
+        real = record["real"] or {}
+        code = record["code"]
+        score = record["final_score"]
+        grade = record["grade"]
+        score_change = self.short_score_change(real)
+        profit = self.short_profit_text(real, code)
+        confidence = real.get("data_confidence") or "-"
+        action = real.get("action_summary") or self.briefing_comment(
+            record["quant_score"],
+            record["news_score"],
+            score,
+        )
+        grade_color = "#ef4444" if score >= 72 else "#2563eb" if score >= 65 else "#64748b"
+
+        return self.card(
+            ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Column(
+                                [
+                                    ft.Text(record["name"], weight=ft.FontWeight.BOLD, size=15),
+                                    ft.Text(code, size=11, color="#64748b"),
+                                ],
+                                expand=True,
+                                spacing=1,
+                            ),
+                            ft.Text(grade, size=12, weight=ft.FontWeight.BOLD, color=grade_color),
+                        ],
+                        vertical_alignment=ft.CrossAxisAlignment.START,
+                    ),
+                    ft.Row(
+                        [
+                            ft.Text(f"점수 {score:.0f}", size=13, weight=ft.FontWeight.BOLD),
+                            ft.Text(score_change, size=12, color="#2563eb"),
+                            ft.Text(f"신뢰도 {confidence}", size=12, color="#64748b"),
+                        ],
+                        spacing=8,
+                        wrap=True,
+                    ),
+                    *(
+                        [ft.Text(profit, size=12, color="#334155")]
+                        if profit
+                        else []
+                    ),
+                    ft.Text(action, size=12, color="#334155", max_lines=2),
+                    ft.Row(
+                        [
+                            self.small_primary_button(
+                                "상세 보기",
+                                lambda _, selected_code=code: self.open_stock_detail(selected_code),
+                            )
+                        ],
+                        alignment=ft.MainAxisAlignment.END,
+                    ),
+                ],
+                spacing=7,
+            ),
+            padding=13,
+        )
+
+    def open_stock_detail(self, code):
+        self.selected_detail_code = str(code or "").upper()
+        self.selected_detail_tab = "요약"
+        self.render()
+
+    def close_stock_detail(self, _=None):
+        self.selected_detail_code = ""
+        self.selected_detail_tab = "요약"
+        self.render()
+
+    def set_detail_tab(self, tab):
+        self.selected_detail_tab = tab
+        self.render()
+
+    def short_score_change(self, record):
+        diff = (record or {}).get("final_score_diff")
+
+        if diff is None:
+            return "전회 -"
+
+        return f"전회 {safe_number(diff):+.1f}"
+
+    def short_profit_text(self, record, code):
+        if record and safe_number(record.get("holding_quantity", 0)) > 0:
+            return f"평단 대비 {safe_number(record.get('profit_rate', 0)):+.1f}%"
+
+        holding = self.holdings.get(code, {})
+        quantity = safe_number(holding.get("quantity", 0))
+        avg_price = safe_number(holding.get("avg_price", 0))
+        current_price = self.current_price_for(code)
+
+        if quantity <= 0 or avg_price <= 0 or current_price <= 0:
+            return ""
+
+        return f"평단 대비 {((current_price - avg_price) / avg_price) * 100:+.1f}%"
+
+    def stock_detail_view(self):
+        item = self.stock_by_code(self.selected_detail_code)
+
+        if not item:
+            return ft.Column(
+                [
+                    self.header("종목 상세", "선택한 종목을 찾을 수 없습니다."),
+                    self.secondary_button("돌아가기", self.close_stock_detail),
+                ],
+                spacing=14,
+            )
+
+        record = self.record_for_item(item)
+        tabs = ["요약", "점수", "뉴스", "시나리오", "전략", "이벤트", "기록"]
+        content = {
+            "요약": self.detail_summary_tab,
+            "점수": self.detail_score_tab,
+            "뉴스": self.detail_news_tab,
+            "시나리오": self.detail_scenario_tab,
+            "전략": self.detail_strategy_tab,
+            "이벤트": self.detail_event_tab,
+            "기록": self.detail_history_tab,
+        }.get(self.selected_detail_tab, self.detail_summary_tab)(record)
+
+        return ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Column(
+                            [
+                                ft.Text(record["name"], size=22, weight=ft.FontWeight.BOLD),
+                                ft.Text(record["code"], size=12, color="#64748b"),
+                            ],
+                            expand=True,
+                            spacing=2,
+                        ),
+                        self.secondary_button("닫기", self.close_stock_detail),
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                ft.Row(
+                    [
+                        self.chip_button(
+                            tab,
+                            self.selected_detail_tab == tab,
+                            lambda _, selected_tab=tab: self.set_detail_tab(selected_tab),
+                        )
+                        for tab in tabs
+                    ],
+                    spacing=7,
+                    wrap=True,
+                ),
+                content,
+            ],
+            spacing=14,
+            scroll=ft.ScrollMode.AUTO,
+        )
+
+    def detail_summary_tab(self, record):
+        real = record["real"] or {}
+        return ft.Column(
+            [
+                self.detail_status_card(record),
+                self.info_rows_card(
+                    [
+                        ("현재 판단", real.get("user_adjusted_action") or real.get("action_summary") or record["grade"]),
+                        ("평단 대비 수익률", self.short_profit_text(real, record["code"]) or "-"),
+                        ("핵심 이유", real.get("score_change_reason") or real.get("daily_core") or "-"),
+                        ("행동 요약", real.get("action_summary") or "-"),
+                    ]
+                ),
+            ],
+            spacing=10,
+        )
+
+    def detail_status_card(self, record):
+        real = record["real"] or {}
+        diff = real.get("final_score_diff")
+        diff_text = "전회 비교 없음" if diff is None else f"전회 대비 {safe_number(diff):+.1f}점"
+        return self.card(
+            ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Text(f"등급: {record['grade']}", weight=ft.FontWeight.BOLD, expand=True),
+                            ft.Text(f"{record['final_score']:.0f}점", weight=ft.FontWeight.BOLD, color="#2563eb"),
+                        ],
+                        spacing=8,
+                    ),
+                    ft.Text(diff_text, size=12, color="#64748b"),
+                    *(
+                        [ft.Text(real.get("event_warning"), size=12, color="#ef4444")]
+                        if real.get("event_warning")
+                        else []
+                    ),
+                ],
+                spacing=5,
+            ),
+            padding=13,
+            bgcolor="#f8fafc",
+        )
+
+    def detail_score_tab(self, record):
+        real = record["real"] or {}
+        factor_scores = real.get("factor_scores") or {}
+        risk_reasons = real.get("risk_reasons") or []
+        rows = [
+            ("최종 점수", f"{record['final_score']:.1f}"),
+            ("퀀트 점수", f"{record['quant_score']:.1f}"),
+            ("뉴스 점수", f"{record['news_score']:.1f}"),
+            ("데이터 신뢰도", real.get("data_confidence") or "-"),
+            ("감점 합계", f"{safe_number(real.get('risk_adjustment_penalty_total', 0)):.1f}"),
+        ]
+        labels = {
+            "value": "가치",
+            "quality": "품질",
+            "growth": "성장",
+            "stability": "안정성",
+            "momentum": "모멘텀",
+            "dividend": "배당",
+        }
+
+        for key, label in labels.items():
+            rows.append((f"{label} 점수", f"{safe_number(factor_scores.get(key, 0)):.1f}"))
+
+        return ft.Column(
+            [
+                self.info_rows_card(rows),
+                self.info_list_card("감점 사유", risk_reasons or ["감점 사유 없음"]),
+                self.info_list_card(
+                    "데이터 신뢰도 이유",
+                    real.get("data_confidence_reasons") or ["데이터 신뢰도 정보 없음"],
+                ),
+            ],
+            spacing=10,
+        )
+
+    def detail_news_tab(self, record):
+        real = record["real"] or {}
+        news_items = real.get("news") or self.sample_news_items(record["code"], record["name"])
+        return ft.Column(
+            [
+                self.news_summary_box(news_items),
+                ft.Column(
+                    [self.news_item_row(item) for item in news_items[:8]],
+                    spacing=8,
+                ),
+            ],
+            spacing=10,
+        )
+
+    def detail_scenario_tab(self, record):
+        real = record["real"] or {}
+        program_targets = real.get("program_target_prices") or {}
+        downside = real.get("downside_scenario") or {}
+        analyst_target = safe_number(
+            real.get("analyst_target_price")
+            or real.get("target_price", 0)
+        )
+        analyst_high = safe_number(real.get("analyst_target_high", 0))
+        analyst_low = safe_number(real.get("analyst_target_low", 0))
+        price = safe_number(real.get("price") or record.get("price", 0))
+        currency = real.get("currency") or record.get("currency") or ("KRW" if str(record["code"]).isdigit() else "USD")
+        analyst_upside = (
+            ((analyst_target - price) / price) * 100
+            if analyst_target > 0 and price > 0
+            else 0
+        )
+
+        def price_text(value):
+            value = safe_number(value)
+            if value <= 0:
+                return "-"
+            return self.format_price(record["code"], value, currency)
+
+        analyst_rows = [
+            (
+                "평균 목표가",
+                price_text(analyst_target)
+                + (f" ({analyst_upside:+.1f}%)" if analyst_target > 0 and price > 0 else ""),
+            ),
+            ("상단 목표가", price_text(analyst_high)),
+            ("하단 목표가", price_text(analyst_low)),
+            ("설명", "증권사 또는 데이터 제공처의 애널리스트 목표가입니다."),
+        ]
+        program_rows = [
+            ("보수 목표가", price_text(program_targets.get("conservative", 0))),
+            ("기준 목표가", price_text(program_targets.get("base", 0))),
+            ("공격 목표가", price_text(program_targets.get("aggressive", 0))),
+            ("산출 기준", program_targets.get("method") or "-"),
+            ("이유", program_targets.get("reason") or "-"),
+            ("설명", program_targets.get("basis") or "-"),
+        ]
+        downside_rows = [
+            ("하락 위험도", downside.get("risk_level") or "-"),
+            ("1차 지지선", price_text(downside.get("support_1", 0))),
+            ("2차 지지선", price_text(downside.get("support_2", 0))),
+            ("손절/점검선", price_text(downside.get("stop_check", 0))),
+            ("산출 기준", downside.get("method") or "-"),
+            ("요약", downside.get("summary") or "-"),
+        ]
+        return ft.Column(
+            [
+                self.info_list_card(
+                    "시나리오 요약",
+                    [
+                        real.get("scenario_summary")
+                        or "시나리오 데이터가 없으면 서버 분석을 새로고침하세요.",
+                        "프로그램 산출 목표가와 하락 시나리오는 예측값이 아니라 대응 기준가입니다.",
+                    ],
+                ),
+                self.info_rows_card(analyst_rows),
+                self.info_rows_card(program_rows),
+                self.info_rows_card(downside_rows),
+                self.info_list_card(
+                    "하락 시나리오 이유",
+                    downside.get("reasons") or ["위험 이유 데이터 없음"],
+                ),
+            ],
+            spacing=10,
+        )
+
+    def detail_strategy_tab(self, record):
+        real = record["real"] or {}
+        strategy = real.get("user_strategy") or {}
+        strategy_name = (
+            strategy.get("strategy")
+            or strategy.get("name")
+            or strategy.get("type")
+            or "-"
+        )
+        rows = [
+            ("사용자 전략", strategy_name),
+            ("전략 판단", real.get("user_adjusted_action") or "-"),
+            ("목표가", self.target_text(real) or "-"),
+            ("손절 기준", real.get("stop_loss_basis") or "-"),
+            ("추가매수 기준", real.get("add_buy_basis") or "-"),
+            ("보유 이유", real.get("hold_reason") or "-"),
+            ("메모", strategy.get("memo") or real.get("user_strategy_reason") or "-"),
+        ]
+        return self.info_rows_card(rows)
+
+    def detail_event_tab(self, record):
+        real = record["real"] or {}
+        events = real.get("events") or []
+        controls = []
+
+        if real.get("event_warning"):
+            controls.append(
+                self.card(
+                    ft.Text(real.get("event_warning"), size=13, color="#ef4444"),
+                    padding=12,
+                    bgcolor="#fff7ed",
+                )
+            )
+
+        controls.append(
+            ft.Column(
+                [
+                    self.event_item_card(item)
+                    for item in events
+                ] or [self.empty_state("등록된 이벤트가 없습니다.")],
+                spacing=8,
+            )
+        )
+        return ft.Column(controls, spacing=10)
+
+    def event_item_card(self, item):
+        return self.card(
+            ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Text(item.get("event_title", "이벤트"), weight=ft.FontWeight.BOLD, expand=True),
+                            ft.Text(item.get("importance", "medium"), size=11, color="#64748b"),
+                        ],
+                        spacing=8,
+                    ),
+                    ft.Text(
+                        f"{item.get('event_type', '-')} · {item.get('event_date', '-')}",
+                        size=12,
+                        color="#334155",
+                    ),
+                    *(
+                        [ft.Text(item.get("memo"), size=12, color="#64748b")]
+                        if item.get("memo")
+                        else []
+                    ),
+                ],
+                spacing=4,
+            ),
+            padding=12,
+        )
+
+    def detail_history_tab(self, record):
+        real = record["real"] or {}
+        score_change = real.get("score_change") or {}
+        history = real.get("analysis_history") or real.get("prediction_history") or []
+        rows = [
+            ("이전 점수", self.none_dash(score_change.get("previous_final_score"))),
+            ("현재 점수", self.none_dash(score_change.get("current_final_score"))),
+            ("등급 변경", "예" if score_change.get("rating_changed") else "아니오"),
+            ("변경 이유", score_change.get("score_change_reason") or "-"),
+        ]
+        return ft.Column(
+            [
+                self.info_rows_card(rows),
+                ft.Column(
+                    [
+                        self.history_item_card(item)
+                        for item in history[:8]
+                    ] or [self.empty_state("과거 판단 기록이 없습니다.")],
+                    spacing=8,
+                ),
+            ],
+            spacing=10,
+        )
+
+    def history_item_card(self, item):
+        return self.card(
+            ft.Column(
+                [
+                    ft.Text(item.get("analyzed_at", "-"), size=11, color="#64748b"),
+                    ft.Text(
+                        f"{safe_number(item.get('final_score', 0)):.1f}점 · {item.get('rating', '-')}",
+                        size=13,
+                        weight=ft.FontWeight.BOLD,
+                    ),
+                    ft.Text(item.get("action_summary") or "-", size=12, color="#334155"),
+                    ft.Text(
+                        f"7일 후 {self.none_dash(item.get('return_after_7d'))} / 30일 후 {self.none_dash(item.get('return_after_30d'))}",
+                        size=11,
+                        color="#64748b",
+                    ),
+                ],
+                spacing=3,
+            ),
+            padding=12,
+        )
+
+    def info_rows_card(self, rows):
+        return self.card(
+            ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Text(label, size=12, color="#64748b", width=105),
+                            ft.Text(str(value), size=12, color="#111827", expand=True),
+                        ],
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.START,
+                    )
+                    for label, value in rows
+                ],
+                spacing=8,
+            ),
+            padding=13,
+        )
+
+    def info_list_card(self, title, items):
+        return self.card(
+            ft.Column(
+                [
+                    ft.Text(title, weight=ft.FontWeight.BOLD, size=13),
+                    *[
+                        ft.Text(f"- {item}", size=12, color="#334155")
+                        for item in items
+                    ],
+                ],
+                spacing=5,
+            ),
+            padding=13,
+        )
+
+    @staticmethod
+    def none_dash(value):
+        return "-" if value is None or value == "" else value
 
     def metric_card(self, title, value, wide=False):
         return self.card(
@@ -756,7 +1464,6 @@ class MobileStockApp:
             padding=12,
             bgcolor="#f8fafc",
         )
-
     def refresh_progress_panel(self):
         if not self.analysis_loading and not self.analysis_loading_message:
             if not self.analysis_last_duration:
@@ -857,6 +1564,10 @@ class MobileStockApp:
                 bgcolor="#f8fafc",
             )
 
+        filtered_alerts = self.filtered_alerts()
+        visible_alerts = filtered_alerts if self.alert_expanded else filtered_alerts[:4]
+        hidden_count = max(len(filtered_alerts) - len(visible_alerts), 0)
+
         return self.card(
             ft.Column(
                 [
@@ -873,26 +1584,43 @@ class MobileStockApp:
                         spacing=8,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
-                    self.alert_summary_row(),
+                    self.alert_filter_row(),
+                    *(
+                        [self.alert_detail_panel(self.selected_alert)]
+                        if self.selected_alert
+                        else []
+                    ),
                     ft.Column(
-                        [self.alert_tile(alert) for alert in self.alerts[:4]],
+                        [self.alert_tile(alert) for alert in visible_alerts]
+                        or [self.empty_state("선택한 조건의 알림이 없습니다.")],
                         spacing=8,
                     ),
                     *(
                         [
                             ft.Text(
-                                f"외 {len(self.alerts) - 4}건의 알림이 더 있습니다.",
+                                f"외 {hidden_count}건의 알림이 더 있습니다.",
                                 size=11,
                                 color="#94a3b8",
                             )
                         ]
-                        if len(self.alerts) > 4
+                        if hidden_count > 0
                         else []
                     ),
                     ft.Row(
                         [
+                            *(
+                                [
+                                    self.secondary_button(
+                                        "접기" if self.alert_expanded else "더보기",
+                                        self.toggle_alert_expanded,
+                                    )
+                                ]
+                                if len(filtered_alerts) > 4
+                                else []
+                            ),
                             self.secondary_button("알림 비우기", self.clear_alerts),
                         ],
+                        spacing=8,
                         alignment=ft.MainAxisAlignment.END,
                     ),
                 ],
@@ -901,6 +1629,22 @@ class MobileStockApp:
             padding=12,
             bgcolor="#f8fafc",
         )
+
+    def filtered_alerts(self):
+        level_map = {
+            "위험": "danger",
+            "주의": "watch",
+            "긍정": "good",
+        }
+        level = level_map.get(self.alert_filter)
+
+        if not level:
+            return list(self.alerts)
+
+        return [
+            alert for alert in self.alerts
+            if alert.get("level") == level
+        ]
 
     def alert_summary_row(self):
         danger = sum(1 for alert in self.alerts if alert.get("level") == "danger")
@@ -916,6 +1660,65 @@ class MobileStockApp:
             spacing=6,
             wrap=True,
         )
+
+    def alert_filter_row(self):
+        counts = {
+            "전체": len(self.alerts),
+            "위험": sum(1 for alert in self.alerts if alert.get("level") == "danger"),
+            "주의": sum(1 for alert in self.alerts if alert.get("level") == "watch"),
+            "긍정": sum(1 for alert in self.alerts if alert.get("level") == "good"),
+        }
+        colors = {
+            "전체": "#2563eb",
+            "위험": "#ef4444",
+            "주의": "#f59e0b",
+            "긍정": "#16a34a",
+        }
+
+        return ft.Row(
+            [
+                self.alert_filter_chip(
+                    label,
+                    counts[label],
+                    colors[label],
+                    self.alert_filter == label,
+                )
+                for label in ["전체", "위험", "주의", "긍정"]
+            ],
+            spacing=6,
+            wrap=True,
+        )
+
+    def alert_filter_chip(self, label, count, color, selected):
+        return ft.Container(
+            content=ft.Text(
+                f"{label} {count}",
+                size=11,
+                color="#ffffff" if selected else color,
+                weight=ft.FontWeight.BOLD,
+            ),
+            padding=ft.Padding(9, 6, 9, 6),
+            border_radius=14,
+            bgcolor=color if selected else "#ffffff",
+            border=ft.Border(
+                left=ft.BorderSide(1, color),
+                top=ft.BorderSide(1, color),
+                right=ft.BorderSide(1, color),
+                bottom=ft.BorderSide(1, color),
+            ),
+            ink=True,
+            on_click=lambda _, value=label: self.set_alert_filter(value),
+        )
+
+    def set_alert_filter(self, value):
+        self.alert_filter = value or "전체"
+        self.alert_expanded = False
+        self.selected_alert = None
+        self.render()
+
+    def toggle_alert_expanded(self, _=None):
+        self.alert_expanded = not self.alert_expanded
+        self.render()
 
     @staticmethod
     def alert_count_chip(label, count, color):
@@ -939,8 +1742,19 @@ class MobileStockApp:
 
     def clear_alerts(self, _=None):
         self.alerts = []
+        self.selected_alert = None
+        self.alert_filter = "전체"
+        self.alert_expanded = False
         self.alert_history = set()
         self.snack("알림을 비웠습니다.")
+        self.render()
+
+    def open_alert_detail(self, alert):
+        self.selected_alert = dict(alert or {})
+        self.render()
+
+    def close_alert_detail(self, _=None):
+        self.selected_alert = None
         self.render()
 
     def alert_tile(self, alert):
@@ -985,6 +1799,87 @@ class MobileStockApp:
             padding=10,
             border_radius=8,
             bgcolor="#ffffff",
+            ink=True,
+            on_click=lambda _, item=dict(alert): self.open_alert_detail(item),
+        )
+
+    def alert_detail_panel(self, alert):
+        alert = alert or {}
+        code = str(alert.get("code", "")).upper()
+        record = self.real_record(code)
+        holding = self.holding_text(code)
+        level = alert.get("level", "info")
+        color = {
+            "danger": "#ef4444",
+            "good": "#16a34a",
+            "watch": "#f59e0b",
+        }.get(level, "#2563eb")
+        details = [
+            ("종목", f"{alert.get('name') or self.stock_name_for(code)} ({code})" if code else "-"),
+            ("시간", alert.get("time", "-")),
+            ("알림", alert.get("title", "알림")),
+            ("내용", alert.get("message", "-")),
+        ]
+
+        if record:
+            details.extend([
+                (
+                    "현재가",
+                    self.format_price(
+                        code,
+                        safe_number(record.get("price", 0)),
+                        record.get("currency", None),
+                    ),
+                ),
+                ("1일 등락", f"{safe_number(record.get('change_1d', 0)):+.2f}%"),
+                ("최종 점수", f"{safe_number(record.get('final_score', 0)):.1f}"),
+                ("뉴스 점수", f"{safe_number(record.get('news_score', 0)):.1f}"),
+            ])
+            target = self.target_text(record)
+
+            if target:
+                details.append(("목표가", target))
+
+        if holding:
+            details.append(("보유", holding))
+
+        return ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Container(width=8, height=8, border_radius=4, bgcolor=color),
+                            ft.Text("알림 상세", weight=ft.FontWeight.BOLD, expand=True),
+                            self.secondary_button("닫기", self.close_alert_detail),
+                        ],
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    ft.Column(
+                        [
+                            ft.Row(
+                                [
+                                    ft.Text(label, size=12, color="#64748b", width=72),
+                                    ft.Text(str(value), size=12, color="#111827", expand=True),
+                                ],
+                                spacing=8,
+                            )
+                            for label, value in details
+                        ],
+                        spacing=6,
+                    ),
+                ],
+                spacing=10,
+            ),
+            padding=12,
+            border_radius=8,
+            bgcolor="#ffffff",
+            border=ft.Border(
+                left=ft.BorderSide(1, color),
+                top=ft.BorderSide(1, "#e5e7eb"),
+                right=ft.BorderSide(1, "#e5e7eb"),
+                bottom=ft.BorderSide(1, "#e5e7eb"),
+            ),
         )
 
     def stock_tile(self, item):
@@ -1053,6 +1948,9 @@ class MobileStockApp:
             ),
             padding=13,
         )
+        tile.ink = True
+        tile.on_click = lambda _, selected_code=code: self.select_stock_for_details(selected_code)
+        return tile
 
     def watchlist_view(self):
         return ft.Column(
@@ -1360,7 +2258,7 @@ class MobileStockApp:
                     self.briefing_mode == mode,
                     lambda _, m=mode: self.set_briefing_mode(m),
                 )
-                for mode in ["요약", "뉴스", "재무"]
+                for mode in ["요약", "뉴스", "시나리오", "재무"]
             ],
             spacing=8,
             wrap=True,
@@ -1444,7 +2342,13 @@ class MobileStockApp:
         if self.briefing_mode == "뉴스":
             return [
                 self.real_data_hint(),
-                self.news_content(),
+                self.briefing_news_content(),
+            ]
+
+        if self.briefing_mode == "시나리오":
+            return [
+                self.real_data_hint(),
+                self.briefing_scenario_content(),
             ]
 
         if self.briefing_mode == "재무":
@@ -1489,7 +2393,7 @@ class MobileStockApp:
 
         rows = []
 
-        for grade in ("STRONG BUY", "BUY", "HOLD", "REDUCE", "SELL"):
+        for grade in ("STRONG BUY", "BUY", "WATCH BUY", "HOLD", "REDUCE", "SELL"):
             names = grouped.get(grade)
 
             if names:
@@ -1532,10 +2436,15 @@ class MobileStockApp:
         market = "국내" if code.isdigit() else "해외"
         holding = self.holding_text(code)
         real_line = self.stock_detail_text(real)
-        target = self.target_text(real)
         analyst = real.get("analyst") if real else ""
         score_reason = real.get("score_reason", "") if real else ""
         factor_text = self.factor_score_text(real) if real else ""
+        confidence_text = self.data_confidence_text(real) if real else ""
+        action_summary = real.get("action_summary", "") if real else ""
+        score_change_text = self.score_change_text(real) if real else ""
+        strategy_text = self.user_strategy_text(real) if real else ""
+        event_warning = real.get("event_warning", "") if real else ""
+        profit_text = self.record_profit_text(real) if real else ""
         comment = (
             real.get("comment")
             if real
@@ -1565,6 +2474,15 @@ class MobileStockApp:
                         color="#64748b",
                     ),
                     *(
+                        [ft.Text(score_change_text, size=12, color="#2563eb")]
+                        if score_change_text
+                        else []
+                    ),
+                    *[
+                        ft.Text(line, size=12, color="#334155")
+                        for line in self.daily_summary_lines(record, real)
+                    ],
+                    *(
                         [ft.Text(score_reason, size=11, color="#475569")]
                         if score_reason
                         else []
@@ -1573,6 +2491,36 @@ class MobileStockApp:
                         [ft.Text(factor_text, size=11, color="#64748b")]
                         if factor_text
                         else []
+                    ),
+                    *(
+                        [ft.Text(confidence_text, size=11, color="#64748b")]
+                        if confidence_text
+                        else []
+                    ),
+                    *(
+                        [ft.Text(f"행동 요약: {action_summary}", size=12, color="#334155")]
+                        if action_summary
+                        else []
+                    ),
+                    *(
+                        [ft.Text(strategy_text, size=12, color="#334155")]
+                        if strategy_text
+                        else []
+                    ),
+                    *(
+                        [ft.Text(profit_text, size=12, color="#334155")]
+                        if profit_text
+                        else []
+                    ),
+                    *(
+                        [ft.Text(f"이벤트 경고: {event_warning}", size=12, color="#ef4444")]
+                        if event_warning
+                        else []
+                    ),
+                    ft.Text(
+                        self.score_formula_text(record),
+                        size=11,
+                        color="#475569",
                     ),
                     *(
                         [ft.Text(real_line, size=12, color="#64748b")]
@@ -1591,9 +2539,14 @@ class MobileStockApp:
                         else []
                     ),
                     *(
-                        [ft.Text(target, size=12, color="#ef4444", weight=ft.FontWeight.BOLD)]
-                        if target
-                        else []
+                        [
+                            ft.Text(
+                                line,
+                                size=11,
+                                color="#334155",
+                            )
+                            for line in self.action_plan_lines(record, real)
+                        ]
                     ),
                     *(
                         [ft.Text(f"애널리스트: {analyst}", size=12, color="#334155")]
@@ -1626,8 +2579,8 @@ class MobileStockApp:
             "value": "가치",
             "quality": "품질",
             "growth": "성장",
-            "stability": "안정",
-            "momentum": "추세",
+            "stability": "안정성",
+            "momentum": "모멘텀",
             "dividend": "배당",
         }
         parts = []
@@ -1635,10 +2588,130 @@ class MobileStockApp:
         for key in ["value", "quality", "growth", "stability", "momentum", "dividend"]:
             if key in factor_scores:
                 parts.append(
-                    f"{labels[key]} {safe_number(factor_scores.get(key, 0)):.1f}"
+                    f"{labels[key]} 점수 {safe_number(factor_scores.get(key, 0)):.1f}"
                 )
 
         return "팩터 | " + " · ".join(parts) if parts else ""
+
+    def data_confidence_text(self, record):
+        confidence = (record or {}).get("data_confidence")
+        stock_type = (record or {}).get("stock_type")
+        reasons = (record or {}).get("data_confidence_reasons") or []
+        penalty = safe_number((record or {}).get("risk_adjustment_penalty_total", 0))
+
+        if not confidence and not stock_type and not reasons:
+            return ""
+
+        reason_text = ", ".join(str(reason) for reason in reasons[:3]) if reasons else "-"
+        return (
+            f"데이터 신뢰도 {confidence or '-'} | 유형 {stock_type or '-'} | "
+            f"위험 보정 {penalty:.1f}점 | {reason_text}"
+        )
+
+    def score_change_text(self, record):
+        change = (record or {}).get("score_change") or {}
+        diff = change.get("final_score_diff")
+        reason = change.get("score_change_reason") or (record or {}).get("score_change_reason")
+        current = change.get("current_final_score") or (record or {}).get("current_final_score")
+
+        if diff is None:
+            return f"점수: {safe_number(current):.0f}점 | 전회 비교 없음"
+
+        return f"점수 변경: {safe_number(diff):+.1f}점 | {reason or '-'}"
+
+    def user_strategy_text(self, record):
+        strategy = (record or {}).get("user_strategy") or {}
+        strategy_name = (
+            strategy.get("strategy")
+            or strategy.get("name")
+            or strategy.get("type")
+            or ""
+        )
+        adjusted = (record or {}).get("user_adjusted_action") or ""
+        reason = (record or {}).get("user_strategy_reason") or ""
+
+        if not strategy_name and not adjusted:
+            return ""
+
+        return (
+            f"사용자 전략: {strategy_name or '-'} | "
+            f"전략 판단: {adjusted or '-'} | {reason}"
+        )
+
+    def record_profit_text(self, record):
+        quantity = safe_number((record or {}).get("holding_quantity", 0))
+
+        if quantity <= 0:
+            return ""
+
+        return f"평단 대비 수익률: {safe_number((record or {}).get('profit_rate', 0)):+.1f}%"
+
+    def daily_summary_lines(self, record, real):
+        final_score = safe_number(record.get("final_score", 0))
+        status = (real or {}).get("daily_status") or self.grade_for(final_score)
+        core = (
+            (real or {}).get("daily_core")
+            or self.briefing_comment(
+                record.get("score", 0),
+                record.get("news_score", 0),
+                final_score,
+            )
+        )
+        judgment = (real or {}).get("daily_judgment") or self.simple_daily_judgment(final_score)
+
+        return [
+            f"상태: {status}",
+            f"오늘 핵심: {core}",
+            f"점수: {final_score:.0f}점",
+            f"판단: {judgment}",
+        ]
+
+    @staticmethod
+    def simple_daily_judgment(final_score):
+        if final_score >= 85:
+            return "보유 유지 / 신규 매수는 분할 접근"
+        if final_score >= 72:
+            return "보유 유지 / 조정 시 분할 추가매수"
+        if final_score >= 55:
+            return "보유 유지 / 추가매수는 조정 시"
+        if final_score >= 40:
+            return "보유 비중 점검 / 신규 매수 보류"
+        return "비중 축소 또는 관망"
+
+    def score_formula_text(self, record):
+        quant_score = safe_number(record.get("score", 0))
+        news_score = safe_number(record.get("news_score", 0))
+        final_score = safe_number(record.get("final_score", 0))
+        return (
+            f"최종 점수 산식 | 퀀트 {quant_score:.1f} x 70% + "
+            f"뉴스 {news_score:.1f} x 30% = {final_score:.1f}"
+        )
+
+    def action_plan_lines(self, record, real):
+        if not real:
+            final_score = safe_number(record.get("final_score", 0))
+            news_score = safe_number(record.get("news_score", 0))
+            return [
+                f"매수 이유: {self.briefing_comment(record.get('score', 0), news_score, final_score)}",
+                "위험 요소: 실시간 분석 데이터 확인 필요",
+                "목표가: 데이터 없음",
+                "손절 기준: 현재가 확인 후 -10% 기준으로 설정",
+                "추가 매수 기준: 분석 데이터 갱신 후 판단",
+                "보유 이유: 관심종목으로 관찰",
+                "다음 확인 날짜: 데이터 갱신 후 재확인",
+            ]
+
+        target = self.target_text(real) or "목표가 데이터 없음"
+        lines = [
+            f"매수 이유: {real.get('buy_reason') or '점수와 뉴스 흐름을 함께 확인하세요.'}",
+            f"위험 요소: {real.get('risk_factors') or '뚜렷한 위험 신호는 제한적입니다.'}",
+            f"목표가: {target}",
+            f"손절 기준: {real.get('stop_loss_basis') or '현재가 확인 후 -10% 기준으로 설정'}",
+            f"추가 매수 기준: {real.get('add_buy_basis') or '모멘텀 개선 시 분할 접근'}",
+            f"보유 이유: {real.get('hold_reason') or '점수와 목표가를 보며 유지 검토'}",
+            f"다음 확인 날짜: {real.get('next_check_date') or '1주일 이내 재확인'}",
+        ]
+        return lines
 
     def briefing_comment(self, quant_score, news_score, final_score):
         if final_score >= 85:
@@ -1655,10 +2728,12 @@ class MobileStockApp:
         return "위험 신호가 더 커서 관망 또는 비중 축소 검토 구간입니다."
 
     def news_view(self):
+        self.ensure_selected_stock_codes()
         return ft.Column(
             [
                 self.header("뉴스", "호재/악재와 날짜를 종목별로 확인"),
                 self.group_dropdown(),
+                self.news_stock_selector(),
                 self.real_data_hint(),
                 self.news_content(),
             ],
@@ -1667,7 +2742,12 @@ class MobileStockApp:
         )
 
     def news_content(self):
-        records = self.records_for_current_group()
+        records = [
+            (item, record)
+            for item, record in self.records_for_current_group()
+            if not self.selected_news_code
+            or item.get("code") == self.selected_news_code
+        ]
 
         return ft.Column(
             [
@@ -1677,6 +2757,160 @@ class MobileStockApp:
             or [self.empty_state("뉴스를 볼 종목이 없습니다.")],
             spacing=10,
         )
+
+    def briefing_news_content(self):
+        self.ensure_selected_stock_codes()
+        stocks = self.current_stocks()
+
+        if not stocks:
+            return self.empty_state("뉴스를 볼 종목이 없습니다.")
+
+        if not self.selected_news_code:
+            self.selected_news_code = stocks[0].get("code", "")
+
+        return ft.Column(
+            [
+                self.news_group_stock_list(stocks),
+                self.news_selected_stock_card(),
+            ],
+            spacing=10,
+        )
+
+    def briefing_scenario_content(self):
+        self.ensure_selected_stock_codes()
+        stocks = self.current_stocks()
+
+        if not stocks:
+            return self.empty_state("시나리오를 볼 종목이 없습니다.")
+
+        if not self.selected_news_code:
+            self.selected_news_code = stocks[0].get("code", "")
+
+        selected = next(
+            (
+                item
+                for item in stocks
+                if item.get("code") == self.selected_news_code
+            ),
+            stocks[0],
+        )
+
+        return ft.Column(
+            [
+                self.news_group_stock_list(stocks),
+                self.detail_scenario_tab(self.record_for_item(selected)),
+            ],
+            spacing=10,
+        )
+
+    def news_group_stock_list(self, stocks):
+        return self.card(
+            ft.Column(
+                [
+                    ft.Text(
+                        "그룹 종목",
+                        weight=ft.FontWeight.BOLD,
+                        size=13,
+                        color="#111827",
+                    ),
+                    ft.Row(
+                        [
+                            self.news_stock_chip(item)
+                            for item in stocks
+                        ],
+                        spacing=8,
+                        wrap=True,
+                    ),
+                ],
+                spacing=8,
+            ),
+            padding=12,
+            bgcolor="#f8fafc",
+        )
+
+    def news_stock_chip(self, item):
+        code = item.get("code", "")
+        name = item.get("name", code)
+        selected = code == self.selected_news_code
+        score = self.news_score_for(code)
+
+        return ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text(
+                        name,
+                        size=11,
+                        weight=ft.FontWeight.BOLD,
+                        color="#ffffff" if selected else "#111827",
+                        max_lines=1,
+                    ),
+                    ft.Text(
+                        f"{code} · 뉴스 {score:.0f}",
+                        size=10,
+                        color="#dbeafe" if selected else "#64748b",
+                        max_lines=1,
+                    ),
+                ],
+                spacing=1,
+            ),
+            padding=ft.Padding(10, 7, 10, 7),
+            bgcolor="#2563eb" if selected else "#ffffff",
+            border_radius=10,
+            border=ft.Border(
+                left=ft.BorderSide(1, "#2563eb" if selected else "#dbe4ef"),
+                top=ft.BorderSide(1, "#2563eb" if selected else "#dbe4ef"),
+                right=ft.BorderSide(1, "#2563eb" if selected else "#dbe4ef"),
+                bottom=ft.BorderSide(1, "#2563eb" if selected else "#dbe4ef"),
+            ),
+            ink=True,
+            on_click=lambda _, selected_code=code: self.select_news_stock(selected_code),
+        )
+
+    def select_news_stock(self, code):
+        self.selected_news_code = code or ""
+        self.render()
+
+    def news_selected_stock_card(self):
+        records = list(self.records_for_current_group())
+        selected = None
+
+        for item, record in records:
+            if item.get("code") == self.selected_news_code:
+                selected = (item, record)
+                break
+
+        if selected is None and records:
+            selected = records[0]
+            self.selected_news_code = selected[0].get("code", "")
+
+        if selected is None:
+            return self.empty_state("뉴스를 볼 종목이 없습니다.")
+
+        item, record = selected
+        return self.news_stock_card(item, record)
+
+    def news_stock_selector(self):
+        stocks = self.current_stocks()
+
+        if not stocks:
+            return self.empty_state("뉴스를 볼 종목이 없습니다.")
+
+        return ft.Dropdown(
+            label="뉴스 종목",
+            value=self.selected_news_code or stocks[0].get("code", ""),
+            options=[
+                ft.dropdown.Option(
+                    key=item.get("code", ""),
+                    text=f"{item.get('name', item.get('code', ''))} ({item.get('code', '')})",
+                )
+                for item in stocks
+            ],
+            on_select=self.on_news_stock_change,
+            dense=True,
+        )
+
+    def on_news_stock_change(self, event):
+        self.select_news_stock(event.control.value or "")
 
     def news_stock_card(self, item, record):
         code = item.get("code", "")
@@ -1775,6 +3009,7 @@ class MobileStockApp:
             impact_score,
             date if date != "-" else "",
         )
+        link = str(news.get("link") or "").strip()
 
         return ft.Container(
             content=ft.Column(
@@ -1786,10 +3021,27 @@ class MobileStockApp:
                         ],
                         spacing=8,
                     ),
-                    ft.Text(
-                        news.get("title") or "-",
-                        size=13,
-                        color="#111827",
+                    ft.Row(
+                        [
+                            ft.Text(
+                                news.get("title") or "-",
+                                size=13,
+                                color="#111827",
+                                expand=True,
+                            ),
+                            *(
+                                [
+                                    self.small_primary_button(
+                                        "자세히",
+                                        lambda _, url=link: self.open_news_link(url),
+                                    )
+                                ]
+                                if link
+                                else []
+                            ),
+                        ],
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.START,
                     ),
                     ft.Text(summary, size=12, color="#334155"),
                     *(
@@ -1802,6 +3054,21 @@ class MobileStockApp:
             ),
             padding=ft.Padding(0, 2, 0, 2),
         )
+
+    def open_news_link(self, url):
+        if not url:
+            self.snack("열 수 있는 뉴스 링크가 없습니다.")
+            return
+
+        try:
+            launcher = getattr(self.page, "launch_url", None)
+
+            if callable(launcher):
+                launcher(url)
+            else:
+                self.page.launch_url(url)
+        except Exception as exc:
+            self.snack(f"뉴스 열기 실패: {exc}")
 
     def sample_news_items(self, code, name):
         score = self.news_score_for(code)
@@ -2136,9 +3403,9 @@ class MobileStockApp:
                                         lambda _, p=period: self.set_chart_period(p),
                                     )
                                     for period in [
-                                        "1일",
-                                        "1주",
-                                        "1개월",
+                                        "일일",
+                                        "일주",
+                                        "한달",
                                         "3개월",
                                         "6개월",
                                         "1년",
@@ -2320,12 +3587,12 @@ class MobileStockApp:
             return bridge_values
 
         counts = {
-            "1일": 48,
-            "1주": 40,
-            "1개월": 30,
-            "3개월": 36,
-            "6개월": 30,
-            "1년": 52,
+            "일일": 120,
+            "일주": 120,
+            "한달": 120,
+            "3개월": 90,
+            "6개월": 126,
+            "1년": 252,
         }
         count = counts.get(period, 30)
         seed = sum(ord(ch) for ch in f"{code}:{period}") or 1
@@ -2352,10 +3619,10 @@ class MobileStockApp:
             return self.real_chart_cache[key]
 
         period_map = {
-            "1일": ("1d", "5m"),
-            "1주": ("5d", "30m"),
-            "1개월": ("1mo", "1d"),
-            "3개월": ("3mo", "1d"),
+            "일일": ("1d", "1m"),
+            "일주": ("5d", "5m"),
+            "한달": ("1mo", "30m"),
+            "3개월": ("3mo", "1h"),
             "6개월": ("6mo", "1d"),
             "1년": ("1y", "1d"),
         }
@@ -2620,11 +3887,7 @@ class MobileStockApp:
         )
 
     def server_settings_panel(self):
-        status = (
-            "Render 서버 사용 중"
-            if self.api_base_url
-            else "서버 URL 없음, 로컬 분석 사용"
-        )
+        status = "분석 서버 사용 중" if self.api_base_url else "서버 URL 없음"
         color = "#16a34a" if self.api_base_url else "#64748b"
 
         return self.card(
@@ -2634,7 +3897,7 @@ class MobileStockApp:
                     ft.Text(status, size=12, color=color),
                     self.api_base_url_input,
                     ft.Text(
-                        "Render URL을 넣으면 새로고침 때 서버 분석을 먼저 사용합니다.",
+                        "Cloud Run 같은 서버 URL을 넣으면 새로고침 때 서버 분석을 사용합니다.",
                         size=12,
                         color="#64748b",
                     ),
@@ -3013,6 +4276,9 @@ class MobileStockApp:
         self.real_records = {}
         self.real_chart_cache = {}
         self.alerts = []
+        self.selected_alert = None
+        self.alert_filter = "전체"
+        self.alert_expanded = False
         self.alert_history = set()
         self.sync_alert_inputs()
         self.snack(f"백업을 복원했습니다: {source_name}")
@@ -3291,7 +4557,7 @@ class MobileStockApp:
         self.render()
 
     def save_server_settings(self, _=None):
-        value = str(self.api_base_url_input.value or "").strip().rstrip("/")
+        value = self.normalized_server_url(self.api_base_url_input.value)
 
         if not value:
             value = DEFAULT_SERVER_URL
@@ -3342,6 +4608,8 @@ class MobileStockApp:
         self.alert_threshold_loss = values["alert_threshold_loss"]
         self.alert_threshold_bad_news = values["alert_threshold_bad_news"]
         self.auto_refresh_interval_minutes = int(values["auto_refresh_interval_minutes"])
+        self.alert_filter = "전체"
+        self.alert_expanded = False
         self.alert_history = set()
         self.save_app_settings()
         self.snack("알림 설정을 저장했습니다.")
@@ -3353,8 +4621,10 @@ class MobileStockApp:
         self.alert_threshold_upside = 30
         self.alert_threshold_loss = -10
         self.alert_threshold_bad_news = 35
-        self.auto_refresh_interval_minutes = 30
+        self.auto_refresh_interval_minutes = 20
         self.sync_alert_inputs()
+        self.alert_filter = "전체"
+        self.alert_expanded = False
         self.alert_history = set()
         self.save_app_settings()
         self.snack("알림 설정을 기본값으로 되돌렸습니다.")
@@ -3438,6 +4708,7 @@ class MobileStockApp:
         save_json(self.watchlist_file, self.groups)
         self.selected_chart_code = code
         self.selected_holding_code = code
+        self.selected_news_code = code
         self.real_records.pop(code, None)
         self.real_chart_cache = {}
         self.search_name.value = ""
@@ -3589,7 +4860,7 @@ class MobileStockApp:
 
     def search_service_factory(self):
         if not self.api_base_url:
-            raise RuntimeError("Render 서버 URL이 필요합니다.")
+            raise RuntimeError("분석 서버 URL이 필요합니다.")
 
         return RemoteAnalysisClient(self.api_base_url)
 
@@ -3622,9 +4893,7 @@ class MobileStockApp:
         save_json(self.watchlist_file, self.groups)
         self.selected_group = next(iter(self.groups), "")
         self.stock_preview = None
-        first = self.current_stocks()[0] if self.current_stocks() else {}
-        self.selected_chart_code = first.get("code", "")
-        self.selected_holding_code = first.get("code", "")
+        self.ensure_selected_stock_codes()
         self.real_records = {}
         self.real_chart_cache = {}
         self.snack("그룹을 삭제했습니다.")
@@ -3640,14 +4909,7 @@ class MobileStockApp:
         ]
         save_json(self.watchlist_file, self.groups)
         self.stock_preview = None
-
-        if self.selected_chart_code == code:
-            first = self.current_stocks()[0] if self.current_stocks() else {}
-            self.selected_chart_code = first.get("code", "")
-
-        if self.selected_holding_code == code:
-            first = self.current_stocks()[0] if self.current_stocks() else {}
-            self.selected_holding_code = first.get("code", "")
+        self.ensure_selected_stock_codes()
 
         self.snack("삭제했습니다.")
         self.render()
@@ -3780,7 +5042,7 @@ class MobileStockApp:
             if self.api_base_url:
                 try:
                     self.set_analysis_message(
-                        f"{source} 서버 접속 중... Render 서버를 깨우는 중입니다. 0/{len(stocks)}",
+                        f"{source} 서버 접속 중... 분석 서버를 준비하는 중입니다. 0/{len(stocks)}",
                         "서버 접속 중",
                     )
                     self.set_analysis_message(
@@ -3800,7 +5062,7 @@ class MobileStockApp:
                     ) from remote_exc
             else:
                 raise RuntimeError(
-                    "Render 서버 URL이 필요합니다. 설정에서 서버 주소를 입력하세요."
+                    "분석 서버 URL이 필요합니다. 설정에서 서버 주소를 입력하세요."
                 )
 
             if records is None:
@@ -3818,8 +5080,20 @@ class MobileStockApp:
             self.safe_update()
             return
 
+        previous_scores = {
+            code: safe_number(record.get("final_score", 0))
+            for code, record in self.real_records.items()
+        }
+
+        for record in records:
+            code = str(record.get("code", "")).upper()
+            previous_score = previous_scores.get(code, 0)
+
+            if previous_score > 0:
+                record["previous_final_score"] = previous_score
+
         self.real_records = {
-            record.get("code", ""): record
+            str(record.get("code", "")).upper(): record
             for record in records
             if record.get("code")
         }
@@ -3904,7 +5178,7 @@ class MobileStockApp:
 
     def get_bridge(self):
         raise RuntimeError(
-            "모바일 앱에서는 로컬 분석을 사용하지 않습니다. Render 서버 URL을 설정하세요."
+            "모바일 앱에서는 로컬 분석을 사용하지 않습니다. 분석 서버 URL을 설정하세요."
         )
 
     def reload_data(self):
@@ -3918,23 +5192,16 @@ class MobileStockApp:
         if self.selected_group not in self.groups:
             self.selected_group = next(iter(self.groups), "")
 
-        if self.selected_chart_code not in {
-            item.get("code") for item in self.current_stocks()
-        }:
-            first = self.current_stocks()[0] if self.current_stocks() else {}
-            self.selected_chart_code = first.get("code", "")
-
-        if self.selected_holding_code not in {
-            item.get("code") for item in self.current_stocks()
-        }:
-            first = self.current_stocks()[0] if self.current_stocks() else {}
-            self.selected_holding_code = first.get("code", "")
+        self.ensure_selected_stock_codes()
 
         self.real_records = {}
         self.real_chart_cache = {}
         self.real_data_loaded_at = ""
         self.real_data_error = ""
         self.alerts = []
+        self.selected_alert = None
+        self.alert_filter = "전체"
+        self.alert_expanded = False
         self.alert_history = set()
         self.snack("데이터를 다시 불러왔습니다.")
         self.render()
@@ -4044,6 +5311,10 @@ class MobileStockApp:
                         spacing=8,
                     ),
                     ft.Text(item["summary"], size=12, color="#334155"),
+                    *[
+                        ft.Text(line, size=12, color="#334155")
+                        for line in item.get("detail_lines", [])
+                    ],
                     ft.Text(item["feedback"], size=12, color="#64748b"),
                 ],
                 spacing=3,
@@ -4111,21 +5382,49 @@ class MobileStockApp:
             else "현재가 없음"
         )
         value_text = self.format_price(code, current_value, currency)
+        detail_lines = self.holding_decision_lines(
+            code,
+            quantity,
+            current_price,
+            avg_price,
+            current_value,
+            cost,
+            pnl_rate,
+            score,
+            news_score,
+            record,
+        )
 
         return {
             "code": code,
             "name": name,
             "level": level,
             "pnl_rate": pnl_rate,
+            "current_price": current_price,
+            "avg_price": avg_price,
+            "current_value": current_value,
+            "cost": cost,
+            "weight": weight,
+            "score": score,
+            "news_score": news_score,
+            "market": "국내" if str(code).isdigit() else "해외",
+            "theme": self.stock_theme(code, name, record),
             "pnl_text": f"{pnl_rate:+.1f}%",
             "summary": (
                 f"비중 {weight:.1f}% | 현재 {price_text} | 평가 {value_text} | "
                 f"점수 {score:.1f} | 뉴스 {news_score:.1f}"
             ),
             "feedback": feedback,
+            "detail_lines": detail_lines,
         }
 
     def portfolio_feedback_text(self, pnl_rate, weight, score, news_score, record):
+        if -20 < pnl_rate <= -10 and score >= 45:
+            return "watch", "손절보다는 보유 관찰 구간입니다. 추가매수는 변동성 확인 후 판단하세요."
+
+        if pnl_rate <= -20:
+            return "danger", "평단 대비 -20% 이상 손실입니다. 손실 원인과 비중 축소 여부를 점검하세요."
+
         if pnl_rate <= self.alert_threshold_loss and news_score <= self.alert_threshold_bad_news:
             return "danger", "손실과 뉴스 리스크가 겹쳐 비중 축소 또는 추가 확인이 필요합니다."
 
@@ -4147,6 +5446,208 @@ class MobileStockApp:
             return "good", "점수와 수익률이 모두 양호합니다. 추세 유지 여부를 확인하세요."
 
         return "info", "큰 위험 신호는 제한적입니다. 목표 비중과 새 뉴스만 점검하세요."
+
+    def holding_decision_lines(
+        self,
+        code,
+        quantity,
+        current_price,
+        avg_price,
+        current_value,
+        cost,
+        pnl_rate,
+        score,
+        news_score,
+        record,
+    ):
+        currency = record.get("currency", None) if record else None
+        current_text = self.format_price(code, current_price, currency)
+        avg_text = self.format_price(code, avg_price, currency)
+        pnl_amount = current_value - cost
+        pnl_text = self.format_price(code, abs(pnl_amount), currency)
+        pnl_prefix = "+" if pnl_amount >= 0 else "-"
+        target_text = self.target_text(record) if record else ""
+        stop_text = self.stop_loss_basis_text(code, avg_price, currency)
+        recovery_text = self.recovery_price_text(code, current_price, currency)
+
+        if -20 < pnl_rate <= -10 and score >= 45:
+            decisions = [
+                "손절보다는 보유 관찰",
+                "추가매수는 실적 발표 전후 변동성 확인 후",
+                f"{recovery_text} 회복 시 비중 축소 검토",
+            ]
+        elif pnl_rate <= -20:
+            decisions = [
+                "손실 원인 재점검 우선",
+                "추가매수보다 비중 축소 또는 리스크 확인",
+                f"{recovery_text} 회복 전까지 보수적 대응",
+            ]
+        elif score >= self.alert_threshold_score and pnl_rate >= 0:
+            decisions = [
+                "보유 유지 우호",
+                "추세 유지 시 분할 보유",
+                "급등 시 일부 이익실현 검토",
+            ]
+        elif news_score <= self.alert_threshold_bad_news:
+            decisions = [
+                "보유 관찰",
+                "추가매수는 악재 해소 확인 후",
+                "뉴스 흐름 악화 시 비중 축소 검토",
+            ]
+        else:
+            decisions = [
+                "보유 유지",
+                "추가매수는 지지선 확인 후",
+                "목표 비중 초과 시 일부 조정",
+            ]
+
+        return [
+            f"보유수량: {quantity:g}주",
+            f"평단: {avg_text}",
+            f"현재가: {current_text}",
+            f"평가손익: {pnl_prefix}{pnl_text}",
+            f"평단 대비 수익률: {pnl_rate:+.1f}%",
+            f"목표가: {target_text or '목표가 데이터 없음'}",
+            f"손절 기준: {stop_text}",
+            f"추가매수 기준: {decisions[1]}",
+            "판단:",
+            *[f"- {decision}" for decision in decisions],
+        ]
+
+    def stop_loss_basis_text(self, code, avg_price, currency=None):
+        avg_price = safe_number(avg_price)
+
+        if avg_price <= 0:
+            return "평단 입력 후 -10% 기준"
+
+        stop_price = avg_price * 0.9
+
+        if currency == "USD" or (currency is None and not str(code).isdigit()):
+            return f"${stop_price:,.2f} 이탈 시 재점검"
+
+        rounded = round(stop_price / 1000) * 1000
+        return f"{rounded:,.0f}원 이탈 시 재점검"
+
+    def recovery_price_text(self, code, current_price, currency=None):
+        current_price = safe_number(current_price)
+
+        if current_price <= 0:
+            return "단기 저항선"
+
+        target = current_price * 1.06
+
+        if currency == "USD" or (currency is None and not str(code).isdigit()):
+            return f"${target:,.2f}"
+
+        rounded = round(target / 1000) * 1000
+        return f"{rounded:,.0f}원"
+
+    def portfolio_exposure_panel(self):
+        items = self.portfolio_feedback_items()
+
+        if not items:
+            return self.card(
+                ft.Text(
+                    "보유 수량과 평균가를 입력하면 총 평가금액과 비중 분석이 표시됩니다.",
+                    size=12,
+                    color="#64748b",
+                ),
+                padding=12,
+                bgcolor="#f8fafc",
+            )
+
+        total_value = sum(safe_number(item.get("current_value", 0)) for item in items)
+        total_cost = sum(safe_number(item.get("cost", 0)) for item in items)
+        total_pnl = total_value - total_cost
+        total_pnl_rate = (total_pnl / total_cost * 100) if total_cost > 0 else 0
+        risk_value = sum(
+            safe_number(item.get("current_value", 0))
+            for item in items
+            if (
+                item.get("level") == "danger"
+                or safe_number(item.get("score", 0)) < 55
+                or safe_number(item.get("news_score", 0)) <= self.alert_threshold_bad_news
+            )
+        )
+        risk_weight = (risk_value / total_value * 100) if total_value > 0 else 0
+        market_summary = self.exposure_summary(items, "market", total_value)
+        theme_summary = self.exposure_summary(items, "theme", total_value)
+        over_weight = [
+            f"{item.get('name')} {safe_number(item.get('current_value', 0)) / total_value * 100:.1f}%"
+            for item in items
+            if total_value > 0
+            and safe_number(item.get("current_value", 0)) / total_value >= 0.35
+        ]
+        warning = ", ".join(over_weight) if over_weight else "없음"
+
+        return self.card(
+            ft.Column(
+                [
+                    ft.Text("포트폴리오 비중", weight=ft.FontWeight.BOLD, size=16),
+                    ft.Text(
+                        f"총 평가금액 {total_value:,.0f} | 총 손익 {total_pnl:+,.0f} ({total_pnl_rate:+.1f}%)",
+                        size=12,
+                        color="#334155",
+                    ),
+                    ft.Text(
+                        f"위험 종목 비중 {risk_weight:.1f}% | 국내/해외 {market_summary}",
+                        size=12,
+                        color="#ef4444" if risk_weight >= 30 else "#334155",
+                    ),
+                    ft.Text(
+                        f"테마 비중 {theme_summary}",
+                        size=12,
+                        color="#334155",
+                    ),
+                    ft.Text(
+                        f"한 종목 과다 비중 경고: {warning}",
+                        size=12,
+                        color="#ef4444" if over_weight else "#16a34a",
+                    ),
+                ],
+                spacing=6,
+            ),
+            padding=12,
+            bgcolor="#f8fafc",
+        )
+
+    @staticmethod
+    def exposure_summary(items, key, total_value):
+        if total_value <= 0:
+            return "-"
+
+        buckets = {}
+
+        for item in items:
+            label = item.get(key) or "기타"
+            buckets[label] = buckets.get(label, 0) + safe_number(item.get("current_value", 0))
+
+        return " / ".join(
+            f"{label} {value / total_value * 100:.1f}%"
+            for label, value in sorted(buckets.items(), key=lambda entry: entry[1], reverse=True)
+            if value > 0
+        )
+
+    @staticmethod
+    def stock_theme(code, name, record=None):
+        finance = (record or {}).get("finance") or {}
+        text = " ".join([
+            str(code),
+            str(name),
+            str((record or {}).get("asset_type", "")),
+            str(finance.get("industry", "")),
+        ]).lower()
+
+        if any(word in text for word in ["bio", "바이오", "pharma", "therapeutics", "제약"]):
+            return "바이오"
+        if any(word in text for word in ["ai", "인공지능", "엔비디아", "nvidia", "msft", "meta", "googl", "oracle", "palantir"]):
+            return "AI"
+        if any(word in text for word in ["반도체", "semiconductor", "hbm", "sk하이닉스", "삼성전자", "tsm", "broadcom", "avgo"]):
+            return "반도체"
+        if any(word in text for word in ["방산", "defense", "aerospace", "한화에어로", "lig", "k방산"]):
+            return "방산"
+
+        return "기타"
 
     def current_price_for(self, code):
         record = self.real_record(code)
@@ -4262,8 +5763,56 @@ class MobileStockApp:
                 pass
 
 
+def show_startup_error(page: ft.Page, exc: Exception):
+    details = traceback.format_exc()
+    page.title = "Morning Stock"
+    page.theme_mode = ft.ThemeMode.LIGHT
+    page.padding = 16
+    page.bgcolor = "#0f172a"
+    page.clean()
+    page.add(
+        ft.SafeArea(
+            ft.Column(
+                [
+                    ft.Text(
+                        "앱 시작 오류",
+                        size=24,
+                        weight=ft.FontWeight.BOLD,
+                        color="#ffffff",
+                    ),
+                    ft.Text(
+                        str(exc),
+                        size=13,
+                        color="#fecaca",
+                    ),
+                    ft.Container(
+                        content=ft.Text(
+                            details[-3500:],
+                            size=11,
+                            color="#e2e8f0",
+                            selectable=True,
+                        ),
+                        padding=12,
+                        bgcolor="#111827",
+                        border_radius=8,
+                        expand=True,
+                    ),
+                ],
+                spacing=12,
+                expand=True,
+                scroll=ft.ScrollMode.AUTO,
+            ),
+            expand=True,
+        )
+    )
+    page.update()
+
+
 def main(page: ft.Page):
-    MobileStockApp(page).run()
+    try:
+        MobileStockApp(page).run()
+    except Exception as exc:
+        show_startup_error(page, exc)
 
 
 if __name__ == "__main__":

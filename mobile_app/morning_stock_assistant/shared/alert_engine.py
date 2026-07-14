@@ -18,7 +18,10 @@ class AlertRules:
     change: float = 5
     upside: float = 30
     loss: float = -10
+    hard_loss: float = -20
     bad_news: float = 35
+    volume_ratio: float = 2.5
+    score_drop: float = 12
 
 
 class AlertEngine:
@@ -43,7 +46,13 @@ class AlertEngine:
             change_1d = safe_number(record.get("change_1d", 0))
             news_score = safe_number(record.get("news_score", 0))
             target_upside = safe_number(record.get("target_upside", 0))
+            target_price = safe_number(record.get("target_price", 0))
             price = safe_number(record.get("price", 0))
+            volume_ratio = safe_number(
+                record.get("volume_ratio", 0)
+                or (record.get("finance") or {}).get("volume_ratio", 0)
+            )
+            previous_score = safe_number(record.get("previous_final_score", 0))
             holding = holdings.get(code, {})
             quantity = safe_number(holding.get("quantity", 0))
             avg_price = safe_number(holding.get("avg_price", 0))
@@ -57,13 +66,17 @@ class AlertEngine:
                     f"{name} 평균 점수 {final_score:.1f}점",
                 ))
 
-            if abs(change_1d) >= self.rules.change:
-                direction = "상승" if change_1d > 0 else "하락"
-                level = "good" if change_1d > 0 else "danger"
+            if change_1d <= -abs(self.rules.change):
                 candidates.append((
-                    level,
-                    "가격 변동",
-                    f"{name} 전일 대비 {change_1d:+.2f}% {direction}",
+                    "danger",
+                    "하루 -5% 이상 하락",
+                    f"{name} 전일 대비 {change_1d:+.2f}% 하락",
+                ))
+            elif change_1d >= abs(self.rules.change):
+                candidates.append((
+                    "good",
+                    "하루 +5% 이상 상승",
+                    f"{name} 전일 대비 {change_1d:+.2f}% 상승",
                 ))
 
             if target_upside >= self.rules.upside:
@@ -73,23 +86,53 @@ class AlertEngine:
                     f"{name} 목표가 대비 +{target_upside:.1f}% 여력",
                 ))
 
+            if target_price > 0 and price > 0 and price >= target_price:
+                candidates.append((
+                    "good",
+                    "목표가 도달",
+                    f"{name} 현재가가 목표가 {target_price:,.0f}에 도달 또는 상회",
+                ))
+
             if news_score and news_score <= self.rules.bad_news:
                 candidates.append((
                     "danger",
-                    "뉴스 경고",
+                    "뉴스 강한 악재 발생",
                     f"{name} 뉴스 점수 {news_score:.1f}점",
                 ))
 
             candidates.extend(self.news_alert_candidates(record, name))
 
+            if volume_ratio >= self.rules.volume_ratio:
+                candidates.append((
+                    "watch",
+                    "거래량 급증",
+                    f"{name} 거래량 비율 {volume_ratio:.1f}배",
+                ))
+
+            if previous_score > 0:
+                score_change = final_score - previous_score
+
+                if score_change <= -abs(self.rules.score_drop):
+                    candidates.append((
+                        "danger",
+                        "분석 점수 급락",
+                        f"{name} {previous_score:.1f}점에서 {final_score:.1f}점으로 {score_change:.1f}점 하락",
+                    ))
+
             if quantity > 0 and avg_price > 0 and price > 0:
                 pnl = ((price - avg_price) / avg_price) * 100
 
-                if pnl <= self.rules.loss:
+                if pnl <= self.rules.hard_loss:
                     candidates.append((
                         "danger",
-                        "보유 손익 경고",
-                        f"{name} 평균가 대비 {pnl:.1f}%",
+                        "평단 대비 -20%",
+                        f"{name} 평균가 대비 {pnl:.1f}% 손실",
+                    ))
+                elif pnl <= self.rules.loss:
+                    candidates.append((
+                        "danger",
+                        "평단 대비 -10%",
+                        f"{name} 평균가 대비 {pnl:.1f}% 손실",
                     ))
 
             for level, title, message in candidates:
@@ -128,7 +171,11 @@ class AlertEngine:
 
             if "악재" in label or impact_score <= -4:
                 level = "danger"
-                alert_title = f"뉴스 악재 | {stock_name}"
+                alert_title = (
+                    f"뉴스 강한 악재 발생 | {stock_name}"
+                    if impact_score <= -7
+                    else f"뉴스 악재 | {stock_name}"
+                )
             elif "호재" in label or impact_score >= 4:
                 level = "good"
                 alert_title = f"뉴스 호재 | {stock_name}"

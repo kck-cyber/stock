@@ -5,13 +5,7 @@ description = "Mobile dashboard for Morning Stock Assistant Pro"
 requires-python = ">=3.12"
 dependencies = [
     "flet>=0.85.0",
-    "flet",
-    "pandas",
-    "requests",
-    "yfinance",
-    "beautifulsoup4",
-    "lxml",
-    "sqlalchemy"
+    "certifi>=2025.0.0"
 ]
 
 [tool.flet]

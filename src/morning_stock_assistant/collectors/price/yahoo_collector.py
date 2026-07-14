@@ -841,6 +841,8 @@ class YahooPriceCollector:
             end = datetime.today()
             days = {
                 "1d": 7,
+                "5d": 10,
+                "1wk": 10,
                 "1mo": 45,
                 "3mo": 110,
                 "6mo": 210,

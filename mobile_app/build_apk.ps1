@@ -60,6 +60,8 @@ $BuildArgs = @(
     "--yes"
 )
 
+$BuildArgs += "--no-rich-output"
+
 $Config.android_permissions | ForEach-Object {
     $BuildArgs += @("--android-permissions", $_)
 }

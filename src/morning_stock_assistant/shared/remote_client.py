@@ -47,6 +47,18 @@ class RemoteAnalysisClient:
         period: str = "1mo",
         interval: str | None = None,
     ) -> list[float]:
+        return self.chart_data(
+            code,
+            period=period,
+            interval=interval,
+        ).get("values", [])
+
+    def chart_data(
+        self,
+        code: str,
+        period: str = "1mo",
+        interval: str | None = None,
+    ) -> dict[str, Any]:
         params = {"period": period}
 
         if interval:
@@ -55,11 +67,27 @@ class RemoteAnalysisClient:
         query = urllib.parse.urlencode(params)
         data = self._get_json(f"/api/chart/{code}?{query}")
         values = data.get("values", [])
+        points = data.get("points", [])
 
         if not isinstance(values, list):
-            return []
+            values = []
 
-        return values
+        if not isinstance(points, list):
+            points = []
+
+        if points:
+            point_values = [
+                item.get("close")
+                for item in points
+                if isinstance(item, dict) and item.get("close")
+            ]
+
+            if point_values:
+                values = point_values
+
+        data["values"] = values
+        data["points"] = points
+        return data
 
     def health(self) -> dict[str, Any]:
         return self._get_json("/health")
